@@ -1,6 +1,10 @@
-# baumer_live_focus_full_fixed2.py
-# Stabiler Baumer-Viewer mit Fokus-Messfenster, Binning/Decimation (robust), AOI-Neustart, Autofokus-Stub
-# WICHTIG: Keine Überschneidung mehr mit Harvester-Variable 'h' (cam_w / cam_h statt w/h)
+# baumer_live_focus_ui_keys.py
+# Baumer VCX Live-Viewer (GenTL/Harvester) mit:
+# - Stabiler Anzeige (Frame-Kopie), robuster Pixel-Decode
+# - Mess-ROI + Schärfemetrik (raw & EMA)
+# - AOI-Neustart (1/2/3), Binning/Decimation (robust)
+# - Autofokus-Stub (Hill-Climb)
+# - **Keys-Fenster**: zeigt ALLE Tastenkürzel, per '?' ein-/ausblenden (standardmäßig AN)
 
 import os, sys, time, cv2
 import numpy as np
@@ -25,6 +29,9 @@ ARROW_UP_CODES    = {82, 2490368, 0x260000}
 ARROW_RIGHT_CODES = {83, 2555904, 0x270000}
 ARROW_DOWN_CODES  = {84, 2621440, 0x280000}
 
+# =============================================================================
+# GenICam Utils
+# =============================================================================
 def ensure_paths():
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(BIN_DIR)
@@ -32,7 +39,6 @@ def ensure_paths():
     if not os.path.exists(CTI_PATH):
         print("CTI nicht gefunden:", CTI_PATH); sys.exit(1)
 
-# ==== GenICam Utils ==========================================================
 def set_node(nm, name, value):
     if not name: return False
     try: nm.get_node(name).value = value; return True
@@ -74,7 +80,9 @@ def supports(nm, node_name):
     try: nm.get_node(node_name); return True
     except Exception: return False
 
-# ==== Stabile Pixel-Decode (immer kopiert) ==================================
+# =============================================================================
+# Pixel-Decode (immer Kopie)
+# =============================================================================
 def decode_mono12packed(u8: np.ndarray, w: int, h: int) -> np.ndarray:
     expected = (w*h*3)//2
     triples = u8[:expected].reshape(h, w//2, 3)
@@ -116,7 +124,9 @@ def to_display_u8_copy(comp, pf_str: str):
 
     return u8.reshape(h, -1)[:, :w].copy(), f"Unknown bpp={bpp:.2f}"
 
-# ==== Kamera-Basisconfig =====================================================
+# =============================================================================
+# Kamera-Basisconfig
+# =============================================================================
 def configure_camera_basics(nm):
     for k, v in [("TriggerMode","Off"), ("ExposureMode","Timed"),
                  ("AcquisitionMode","Continuous")]:
@@ -157,7 +167,6 @@ def configure_camera_basics(nm):
 
     return exp_name, gain_name
 
-# ==== AOI/ROI (Kamera) ======================================================
 def set_roi_full(nm):
     try:
         Wmax = int(get_val(nm, "WidthMax")); Hmax = int(get_val(nm, "HeightMax"))
@@ -167,7 +176,9 @@ def set_roi_full(nm):
     set_node(nm, "Width",  (Wmax // w_inc) * w_inc)
     set_node(nm, "Height", (Hmax // h_inc) * h_inc)
 
-# ==== Binning / Decimation (robust) =========================================
+# =============================================================================
+# Binning / Decimation (robust)
+# =============================================================================
 def apply_binning(nm, factor, mode="Average"):
     for n in ("DecimationHorizontal", "DecimationVertical"):
         if supports(nm, n): set_node(nm, n, 1)
@@ -231,7 +242,9 @@ def get_scaling_state(nm):
     d_v = get_int(nm, "DecimationVertical")   if supports(nm,"DecimationVertical")   else 1
     return (b_h or 1), (b_v or 1), (d_h or 1), (d_v or 1)
 
-# ==== Harvester Lifecycle ====================================================
+# =============================================================================
+# Harvester Lifecycle
+# =============================================================================
 def create_ia(h, device_index):
     ia = h.create(device_index)
     try: ia.num_buffers = 4
@@ -294,7 +307,7 @@ def restart_with_scaling(h, device_index, pf_hint, use_binning, factor):
             ok, df = apply_decimation(nm, factor); info = f"Decimation={df[0]}x{df[1]}"
             if not ok:
                 ok, bf = apply_binning(nm, factor, mode="Average"); info = f"Binning={bf[0]}x{bf[1]}"
-        set_roi_full(nm)  # nach Scaling
+        set_roi_full(nm)
     except Exception as e:
         print("Scaling-Fehler:", e); ok = False
 
@@ -313,7 +326,9 @@ def restart_with_scaling(h, device_index, pf_hint, use_binning, factor):
         print("Scaling NICHT unterstützt oder fehlgeschlagen – Stream ohne Änderung neu gestartet.")
     return ia, nm, exp_name, gain_name, pf_str
 
-# ==== Schärfe-Metriken ======================================================
+# =============================================================================
+# Schärfe-Metriken
+# =============================================================================
 def focus_metric_laplacian(u8_roi: np.ndarray) -> float:
     lap = cv2.Laplacian(u8_roi, cv2.CV_64F, ksize=3)
     return float(lap.var())
@@ -332,12 +347,12 @@ FOCUS_METHODS = [("Laplacian", focus_metric_laplacian),
                  ("Tenengrad", focus_metric_tenengrad),
                  ("Brenner",   focus_metric_brenner)]
 
-# ==== Autofokus (Stub) ======================================================
+# =============================================================================
+# Autofokus (Stub)
+# =============================================================================
 class StepperController:
-    def move_relative(self, steps: int):
-        print(f"[Stepper] move_relative({steps}) (Stub)")
-    def wait_settle(self, seconds: float = 0.12):
-        time.sleep(seconds)
+    def move_relative(self, steps: int): print(f"[Stepper] move_relative({steps}) (Stub)")
+    def wait_settle(self, seconds: float = 0.12): time.sleep(seconds)
 
 def autofocus_hill_climb(get_focus_value, stepper: StepperController,
                          start_step=200, min_step=5, settle=0.12):
@@ -361,7 +376,107 @@ def autofocus_hill_climb(get_focus_value, stepper: StepperController,
             step = max(min_step, step // 2)
     return cur
 
-# ==== Main ==================================================================
+# =============================================================================
+# Keys-Fenster (UI)
+# =============================================================================
+def render_keys_image(scale=0.48, title_scale=0.72):
+    """
+    Rendert ein kompaktes Keys-Poster.
+    - Kleine Schrift (scale ~ 0.48)
+    - Zwei Spalten, falls die erste Spalte voll ist
+    - Kürzere Texte, damit nichts abschneidet
+    """
+    # Kompaktere Texte
+    lines = [
+        "Tastenübersicht  (? = an/aus)",
+        "",
+        "Bewegen ROI:",
+        "  ← ↑ → ↓   (Fallback: J/I/L/K)",
+        "Größe/Zentrum ROI:",
+        "  [  ]      kleiner / größer",
+        "  R         zentrieren",
+        "",
+        "Schärfe/Anzeige:",
+        "  M         Metrik wechseln",
+        "  H         Display-Stretch",
+        "",
+        "Binning/Decimation:",
+        "  B / N     Bin +1 / −1",
+        "  X / Z     Dec +1 / −1",
+        "  0         Reset 1×",
+        "",
+        "Kamera-AOI (Neustart):",
+        "  1 / 2 / 3 Full / Half / Quarter",
+        "",
+        "Belichtung/Verstärkung:",
+        "  + / -     Exp ×1.5 / ÷1.5",
+        "  G / g     Gain +1 / −1 dB",
+        "",
+        "Sonstiges:",
+        "  SPACE / P Snapshot",
+        "  F         Autofokus (Stub)",
+        "  ESC       Beenden",
+    ]
+
+    # Leinwand / Layout
+    W, H = 520, 520                       # kompakte Grundfläche
+    PAD = 12
+    COL_GAP = 20
+    TITLE_H = 38
+    COL_W = (W - 3*PAD - COL_GAP) // 2    # zwei Spalten
+
+    img = np.full((H, W, 3), 245, np.uint8)
+
+    # Titelbalken
+    cv2.rectangle(img, (0, 0), (W, TITLE_H), (230, 230, 230), -1)
+    cv2.putText(img, lines[0], (PAD, int(TITLE_H*0.7)),
+                cv2.FONT_HERSHEY_SIMPLEX, title_scale, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Text-Parameter
+    line_h = max(18, int(24 * scale))
+    x = PAD
+    y = TITLE_H + 14
+
+    # Spalten-Renderer
+    def put_line(text, x, y):
+        cv2.putText(img, text, (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, (20, 20, 20), 2, cv2.LINE_AA)
+
+    # Spalte 1 … ggf. auf Spalte 2 umbrechen
+    for t in lines[1:]:
+        if t == "":
+            y += int(line_h * 0.5)
+            continue
+
+        # vor dem Zeichnen: bei Überlauf in nächste Spalte springen
+        if y > H - PAD:
+            # Spalte 2 beginnen
+            x = PAD + COL_W + COL_GAP
+            y = TITLE_H + 14
+
+        # zu lange Einzelzeilen kompakt halten (harte, manuelle Umbrüche)
+        max_chars = 32 if x == PAD else 30  # Spalte 1 etwas breiter
+        if len(t) > max_chars and " " in t:
+            # an geeigneter Stelle brechen (einfacher Greedy)
+            parts = []
+            cur = t
+            while len(cur) > max_chars and " " in cur:
+                cut = cur.rfind(" ", 0, max_chars)
+                if cut <= 0: break
+                parts.append(cur[:cut])
+                cur = cur[cut+1:]
+            parts.append(cur)
+            for p in parts:
+                put_line(p, x, y); y += line_h
+        else:
+            put_line(t, x, y); y += line_h
+
+    return img
+
+
+# =============================================================================
+# Main
+# =============================================================================
 def main():
     ensure_paths()
     h = Harvester(); h.add_file(CTI_PATH); h.update()
@@ -381,8 +496,9 @@ def main():
     ia.start()
 
     cv2.namedWindow("Live", cv2.WINDOW_AUTOSIZE)
-    print("Tasten: ←↑→↓ ROI (J/I/L/K Fallback)  [ ] Größe  R Center  M Metrik  H Stretch  "
-          "B/N Bin ±  X/Z Dec ±  0 Reset  1/2/3 AOI  +/- Exp  G/g Gain  SPACE/P Snapshot  F AF  ESC")
+    cv2.namedWindow("Keys", cv2.WINDOW_AUTOSIZE)
+    show_keys = True
+    print("Drücke '?' um das Keys-Fenster zu zeigen/zu verbergen.")
 
     auto_stretch = DISPLAY_STRETCH
     method_idx = 0
@@ -403,7 +519,7 @@ def main():
                 comp = buf.payload.components[0]
                 disp_u8, decode_label = to_display_u8_copy(comp, pf_str)
 
-            cam_h, cam_w = disp_u8.shape[:2]   # <-- KEIN 'h' überschreiben!
+            cam_h, cam_w = disp_u8.shape[:2]
             roi_w = max(32, min(roi_w, cam_w))
             roi_h = max(32, min(roi_h, cam_h))
             roi_x = min(max(0, roi_x), cam_w - roi_w)
@@ -438,7 +554,7 @@ def main():
             lines = [
                 f"{model} SN:{serial}  {cam_w_node}x{cam_h_node}  PF={pf_str} / {decode_label}",
                 f"Focus({name})  raw={raw:,.1f}   ema={ema:,.1f}   ROI={roi_w}x{roi_h}@({roi_x},{roi_y})",
-                f"FPS={disp_fps:.1f}  Exp={int(exp) if exp else '—'}us  Gain={gain:.2f}dB  Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Stretch={'ON' if auto_stretch else 'OFF'}"
+                f"FPS={disp_fps:.1f}  Exp={int(exp) if exp else '—'}us  Gain={gain:.2f}dB  Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Stretch={'ON' if auto_stretch else 'OFF'}   (?=Keys)"
             ]
             y=20
             for t in lines:
@@ -446,10 +562,20 @@ def main():
 
             cv2.imshow("Live", out)
 
+            if show_keys:
+                cv2.imshow("Keys", render_keys_image())
+            else:
+                # Fenster schließen, wenn es offen war
+                try: cv2.destroyWindow("Keys")
+                except Exception: pass
+
             # --- Tastatur (waitKeyEx für Pfeile) ---
             k = cv2.waitKeyEx(1)
             if k == 27:  # ESC
                 break
+
+            elif k == ord('?'):
+                show_keys = not show_keys
 
             elif k == 32 or k in (ord('p'), ord('P')):  # SPACE / P
                 fn = time.strftime("snapshot_%Y%m%d_%H%M%S.png")
@@ -468,7 +594,7 @@ def main():
             elif (k in ARROW_DOWN_CODES) or (k in (ord('k'), ord('K'))):
                 roi_y += roi_step
 
-            # ROI Größe / Zentrieren
+            # ROI Größe / Zentrum
             elif k == ord('['):
                 roi_w = max(32, roi_w - 16); roi_h = max(32, roi_h - 16)
             elif k == ord(']'):
@@ -561,7 +687,6 @@ def main():
     finally:
         try: stop_destroy(ia)
         except Exception: pass
-        # ACHTUNG: Hier ist 'h' wieder der Harvester!
         try: h.reset()
         except Exception: pass
         cv2.destroyAllWindows()
