@@ -1,28 +1,6 @@
-# baumer_live_focus_full.py
-# Baumer VCX Live-Viewer (GenTL/Harvester) mit:
-# - Stabiler Anzeige (eigene Frame-Kopie → kein Tearing)
-# - Robuster Pixel-Decode (Mono8 / Mono12Packed / Mono12 / Mono16 / Mono10)
-# - Mess-ROI im Bild + Schärfemetriken (Laplacian / Tenengrad / Brenner)
-# - Live-Overlay (Werte, FPS, Bildgröße, PF, Binning/Decimation)
-# - Kamera-AOI (1/2/3) mit sauberem Neustart
-# - Hardware-Binning/Decimation (gleiches FOV, weniger Pixel) mit Neustart
-# - Autofokus-Stub (Hill-Climb) mit Stepper-Controller (Platzhalter)
-#
-# Tasten:
-#   ← ↑ → ↓     Mess-ROI bewegen
-#   [ / ]       Mess-ROI kleiner / größer
-#   R           Mess-ROI zentrieren
-#   M           Schärfemetrik wechseln (Laplacian / Tenengrad / Brenner)
-#   H           Display-Stretch an/aus (nur Anzeige)
-#   B / N       Binning-Faktor +1 / −1
-#   X / Z       Decimation-Faktor +1 / −1
-#   0           Binning & Decimation auf 1× zurücksetzen
-#   1 / 2 / 3   Kamera-AOI Full / Half / Quarter (mit Neustart)
-#   + / -       Exposure ×1.5 / ÷1.5
-#   G / g       Gain +1 / −1 dB
-#   Leertaste / P   Snapshot
-#   F           Autofokus starten (Stub, siehe StepperController)
-#   ESC         Ende
+# baumer_live_focus_full_fixed2.py
+# Stabiler Baumer-Viewer mit Fokus-Messfenster, Binning/Decimation (robust), AOI-Neustart, Autofokus-Stub
+# WICHTIG: Keine Überschneidung mehr mit Harvester-Variable 'h' (cam_w / cam_h statt w/h)
 
 import os, sys, time, cv2
 import numpy as np
@@ -31,17 +9,21 @@ from harvesters.core import Harvester
 # ==== Pfade/Kamera ===========================================================
 BIN_DIR  = r"H:\Baumer_neoAPI_1.5.0_win_x86_64_cpp\bin"   # <— ANPASSEN
 CTI_PATH = rf"{BIN_DIR}\bgapi2_gige.cti"                  # <— ANPASSEN
-TARGET_IP = "192.168.178.2"                               # optional: Kamera-IP für Auswahl
+TARGET_IP = "192.168.178.2"                               # optional: Kamera-IP
 
 # ==== Start-Defaults =========================================================
 START_EXPOSURE_US = 5000.0
 START_GAIN_DB     = 6.0
 START_FPS         = 60.0
-WANT_PACKET       = 9000       # Jumbo; fällt zurück falls nicht möglich
-WANT_THROUGHPUT   = 0          # 0=aus; sonst Bit/s (z. B. 800_000_000)
-DISPLAY_STRETCH   = False      # stabiler Default (mit 'H' toggeln)
+WANT_PACKET       = 9000
+WANT_THROUGHPUT   = 0
+DISPLAY_STRETCH   = False
 
-# ==== Utils & GenICam Helper ================================================
+# ==== Arrow-Key Codes (robust) ==============================================
+ARROW_LEFT_CODES  = {81, 2424832, 0x250000}
+ARROW_UP_CODES    = {82, 2490368, 0x260000}
+ARROW_RIGHT_CODES = {83, 2555904, 0x270000}
+ARROW_DOWN_CODES  = {84, 2621440, 0x280000}
 
 def ensure_paths():
     if hasattr(os, "add_dll_directory"):
@@ -50,6 +32,7 @@ def ensure_paths():
     if not os.path.exists(CTI_PATH):
         print("CTI nicht gefunden:", CTI_PATH); sys.exit(1)
 
+# ==== GenICam Utils ==========================================================
 def set_node(nm, name, value):
     if not name: return False
     try: nm.get_node(name).value = value; return True
@@ -92,7 +75,6 @@ def supports(nm, node_name):
     except Exception: return False
 
 # ==== Stabile Pixel-Decode (immer kopiert) ==================================
-
 def decode_mono12packed(u8: np.ndarray, w: int, h: int) -> np.ndarray:
     expected = (w*h*3)//2
     triples = u8[:expected].reshape(h, w//2, 3)
@@ -106,9 +88,6 @@ def decode_mono12packed(u8: np.ndarray, w: int, h: int) -> np.ndarray:
     return out
 
 def to_display_u8_copy(comp, pf_str: str):
-    """
-    Gibt immer eine EIGENE Kopie (np.uint8, C-contiguous) zurück → kein Tearing.
-    """
     h, w = comp.height, comp.width
     u8 = comp.data
     total = u8.size
@@ -118,89 +97,67 @@ def to_display_u8_copy(comp, pf_str: str):
 
     if "mono8" in pf:
         return u8.reshape(h, w).copy(), "Mono8 (8b)"
-
     if "mono12packed" in pf:
-        img12 = decode_mono12packed(u8, w, h)
-        return (img12>>4).astype(np.uint8, copy=True), "Mono12Packed (>>4)"
-
+        img12 = decode_mono12packed(u8, w, h); return (img12>>4).astype(np.uint8, copy=True), "Mono12Packed (>>4)"
     if "mono12" in pf and "packed" not in pf:
-        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w)
-        return (img16>>4).astype(np.uint8, copy=True), "Mono12 (>>4)"
-
+        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w); return (img16>>4).astype(np.uint8, copy=True), "Mono12 (>>4)"
     if "mono16" in pf:
-        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w)
-        return (img16>>8).astype(np.uint8, copy=True), "Mono16 (>>8)"
-
+        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w); return (img16>>8).astype(np.uint8, copy=True), "Mono16 (>>8)"
     if "mono10" in pf and "packed" not in pf:
-        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w)
-        return (img16>>2).astype(np.uint8, copy=True), "Mono10 (>>2)"
+        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w); return (img16>>2).astype(np.uint8, copy=True), "Mono10 (>>2)"
 
-    # Fallback anhand Bytes/Pixel
     bpp = total / (w*h)
-    if abs(bpp-1.0)<1e-3:
+    if abs(bpp-1.0) < 1e-3:
         return u8.reshape(h, w).copy(), "8b(?)"
-    if abs(bpp-2.0)<1e-3:
-        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w)
-        return (img16>>8).astype(np.uint8, copy=True), "16b(>>8?)"
-    if abs(bpp-1.5)<1e-2 and (w%2==0):
-        img12 = decode_mono12packed(u8, w, h)
-        return (img12>>4).astype(np.uint8, copy=True), "12p(>>4?)"
+    if abs(bpp-2.0) < 1e-3:
+        img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w); return (img16>>8).astype(np.uint8, copy=True), "16b(>>8?)"
+    if abs(bpp-1.5) < 1e-2 and (w % 2 == 0):
+        img12 = decode_mono12packed(u8, w, h); return (img12>>4).astype(np.uint8, copy=True), "12p(>>4?)"
 
     return u8.reshape(h, -1)[:, :w].copy(), f"Unknown bpp={bpp:.2f}"
 
 # ==== Kamera-Basisconfig =====================================================
-
 def configure_camera_basics(nm):
     for k, v in [("TriggerMode","Off"), ("ExposureMode","Timed"),
                  ("AcquisitionMode","Continuous")]:
         set_node(nm, k, v)
 
-    # PixelFormat bevorzugt Mono8 (einfach/schnell)
     pf_list = enum_symbolics(nm, "PixelFormat")
-    if "Mono8" in pf_list:
-        set_node(nm, "PixelFormat", "Mono8")
+    if "Mono8" in pf_list: set_node(nm, "PixelFormat", "Mono8")
 
-    # Auto/Look-Up-Tables/Gamma aus
     set_node(nm, "ExposureAuto", "Off")
     set_node(nm, "GainAuto", "Off")
     set_node(nm, "GammaEnable", False)
     set_node(nm, "LUTEnable", False)
 
-    # BlackLevel auf 0 (falls vorhanden)
     bl_min, bl_max = get_limits(nm, "BlackLevel")
     if bl_min is not None and bl_max is not None:
         set_node(nm, "BlackLevel", 0.0)
 
-    # Exposure (µs)
     exp_name = "ExposureTime" if get_limits(nm, "ExposureTime") != (None, None) else "ExposureTimeAbs"
     emin, emax = get_limits(nm, exp_name)
     set_node(nm, exp_name, float(clamp(START_EXPOSURE_US, emin, emax)))
 
-    # Gain (dB oder Raw)
     gain_name = "Gain" if get_limits(nm, "Gain") != (None, None) else "GainRaw"
     gmin, gmax = get_limits(nm, gain_name)
     set_node(nm, gain_name, float(clamp(START_GAIN_DB, gmin, gmax)))
 
-    # Framerate
     set_node(nm, "AcquisitionFrameRateEnable", True)
     fmin, fmax = get_limits(nm, "AcquisitionFrameRate")
     if fmin is not None or fmax is not None:
         set_node(nm, "AcquisitionFrameRate", float(clamp(START_FPS, fmin, fmax)))
 
-    # Throughput/Packets
     set_node(nm, "DeviceLinkThroughputLimitMode", "Off")
     if WANT_THROUGHPUT and WANT_THROUGHPUT > 0:
         set_node(nm, "DeviceLinkThroughputLimitMode", "On")
         set_node(nm, "DeviceLinkThroughputLimit", int(WANT_THROUGHPUT))
 
     for p in [WANT_PACKET, 9000, 8192, 3000, 1500]:
-        if p and set_node(nm, "GevSCPSPacketSize", int(p)):
-            break
+        if p and set_node(nm, "GevSCPSPacketSize", int(p)): break
 
     return exp_name, gain_name
 
 # ==== AOI/ROI (Kamera) ======================================================
-
 def set_roi_full(nm):
     try:
         Wmax = int(get_val(nm, "WidthMax")); Hmax = int(get_val(nm, "HeightMax"))
@@ -210,34 +167,62 @@ def set_roi_full(nm):
     set_node(nm, "Width",  (Wmax // w_inc) * w_inc)
     set_node(nm, "Height", (Hmax // h_inc) * h_inc)
 
-# ==== Binning / Decimation ===================================================
-
+# ==== Binning / Decimation (robust) =========================================
 def apply_binning(nm, factor, mode="Average"):
-    # Decimation zurücksetzen
     for n in ("DecimationHorizontal", "DecimationVertical"):
         if supports(nm, n): set_node(nm, n, 1)
-    ok = False
-    if supports(nm,"BinningHorizontal") and supports(nm,"BinningVertical"):
-        if supports(nm, "BinningMode"):
-            syms = enum_symbolics(nm, "BinningMode")
-            if mode in syms: set_node(nm, "BinningMode", mode)
-            elif "Average" in syms: set_node(nm, "BinningMode", "Average")
-            elif "Sum" in syms: set_node(nm, "BinningMode", "Sum")
-        set_node(nm, "BinningHorizontal", int(max(1, factor)))
-        set_node(nm, "BinningVertical",   int(max(1, factor)))
-        ok = True
-    return ok
+    if not (supports(nm,"BinningHorizontal") and supports(nm,"BinningVertical")):
+        return False, (1, 1)
+
+    bminH, bmaxH = get_limits(nm, "BinningHorizontal")
+    bminV, bmaxV = get_limits(nm, "BinningVertical")
+    incH = get_inc(nm, "BinningHorizontal", 1)
+    incV = get_inc(nm, "BinningVertical", 1)
+
+    def clamp_factor(val, mn, mx, inc):
+        if mn is None: mn = 1
+        if mx is None: mx = max(1, int(val))
+        val = max(mn, min(mx, int(val)))
+        if inc > 1: val = mn + ((val - mn) // inc) * inc
+        return max(1, int(val))
+
+    fH = clamp_factor(factor, bminH, bmaxH, incH)
+    fV = clamp_factor(factor, bminV, bmaxV, incV)
+
+    if supports(nm, "BinningMode"):
+        syms = enum_symbolics(nm, "BinningMode")
+        if mode in syms: set_node(nm, "BinningMode", mode)
+        elif "Average" in syms: set_node(nm, "BinningMode", "Average")
+        elif "Sum" in syms: set_node(nm, "BinningMode", "Sum")
+
+    okH = set_node(nm, "BinningHorizontal", int(fH))
+    okV = set_node(nm, "BinningVertical",   int(fV))
+    return (okH and okV), (int(fH), int(fV))
 
 def apply_decimation(nm, factor):
-    # Binning zurücksetzen
     for n in ("BinningHorizontal","BinningVertical"):
         if supports(nm, n): set_node(nm, n, 1)
-    ok = False
-    if supports(nm,"DecimationHorizontal") and supports(nm,"DecimationVertical"):
-        set_node(nm, "DecimationHorizontal", int(max(1, factor)))
-        set_node(nm, "DecimationVertical",   int(max(1, factor)))
-        ok = True
-    return ok
+    if not (supports(nm,"DecimationHorizontal") and supports(nm,"DecimationVertical")):
+        return False, (1, 1)
+
+    dminH, dmaxH = get_limits(nm, "DecimationHorizontal")
+    dminV, dmaxV = get_limits(nm, "DecimationVertical")
+    incH = get_inc(nm, "DecimationHorizontal", 1)
+    incV = get_inc(nm, "DecimationVertical", 1)
+
+    def clamp_factor(val, mn, mx, inc):
+        if mn is None: mn = 1
+        if mx is None: mx = max(1, int(val))
+        val = max(mn, min(mx, int(val)))
+        if inc > 1: val = mn + ((val - mn) // inc) * inc
+        return max(1, int(val))
+
+    fH = clamp_factor(factor, dminH, dmaxH, incH)
+    fV = clamp_factor(factor, dminV, dmaxV, incV)
+
+    okH = set_node(nm, "DecimationHorizontal", int(fH))
+    okV = set_node(nm, "DecimationVertical",   int(fV))
+    return (okH and okV), (int(fH), int(fV))
 
 def get_scaling_state(nm):
     b_h = get_int(nm, "BinningHorizontal") if supports(nm,"BinningHorizontal") else 1
@@ -247,10 +232,9 @@ def get_scaling_state(nm):
     return (b_h or 1), (b_v or 1), (d_h or 1), (d_v or 1)
 
 # ==== Harvester Lifecycle ====================================================
-
 def create_ia(h, device_index):
     ia = h.create(device_index)
-    try: ia.num_buffers = 4     # geringe Latenz
+    try: ia.num_buffers = 4
     except Exception: pass
     return ia
 
@@ -269,14 +253,12 @@ def restart_stream(h, device_index, pf_hint=None):
     return ia, nm, exp_name, gain_name, pf_str
 
 def restart_with_roi(h, device_index, pf_hint, scale):
-    # zentrierte ROI via temporärem IA setzen, dann neu starten
     ia_tmp = create_ia(h, device_index)
     nm = ia_tmp.remote_device.node_map
     set_node(nm, "TLParamsLocked", 0)
     try: nm.get_node("AcquisitionStop").execute()
     except Exception: pass
 
-    # zentrierte ROI
     try:
         Wmax = int(get_val(nm, "WidthMax")); Hmax = int(get_val(nm, "HeightMax"))
         w_inc = get_inc(nm, "Width", 2); h_inc = get_inc(nm, "Height", 2)
@@ -301,25 +283,37 @@ def restart_with_scaling(h, device_index, pf_hint, use_binning, factor):
     try: nm.get_node("AcquisitionStop").execute()
     except Exception: pass
 
-    # gleiches FOV → volle ROI
-    set_roi_full(nm)
-
     ok = False
-    if use_binning:
-        ok = apply_binning(nm, factor, mode="Average")
-        if not ok:
-            ok = apply_decimation(nm, factor)
-    else:
-        ok = apply_decimation(nm, factor)
-        if not ok:
-            ok = apply_binning(nm, factor, mode="Average")
+    info = ""
+    try:
+        if use_binning:
+            ok, bf = apply_binning(nm, factor, mode="Average"); info = f"Binning={bf[0]}x{bf[1]}"
+            if not ok:
+                ok, df = apply_decimation(nm, factor); info = f"Decimation={df[0]}x{df[1]}"
+        else:
+            ok, df = apply_decimation(nm, factor); info = f"Decimation={df[0]}x{df[1]}"
+            if not ok:
+                ok, bf = apply_binning(nm, factor, mode="Average"); info = f"Binning={bf[0]}x{bf[1]}"
+        set_roi_full(nm)  # nach Scaling
+    except Exception as e:
+        print("Scaling-Fehler:", e); ok = False
 
     set_node(nm, "TLParamsLocked", 1)
     stop_destroy(ia_tmp)
-    return restart_stream(h, device_index, pf_hint)
+
+    ia = create_ia(h, device_index)
+    nm = ia.remote_device.node_map
+    exp_name, gain_name = configure_camera_basics(nm)
+    pf_str = str(get_val(nm, "PixelFormat")) or (pf_hint or "Mono8")
+    ia.start()
+
+    if ok:
+        print("Scaling OK →", info, f"  Auflösung={int(get_val(nm,'Width'))}x{int(get_val(nm,'Height'))}")
+    else:
+        print("Scaling NICHT unterstützt oder fehlgeschlagen – Stream ohne Änderung neu gestartet.")
+    return ia, nm, exp_name, gain_name, pf_str
 
 # ==== Schärfe-Metriken ======================================================
-
 def focus_metric_laplacian(u8_roi: np.ndarray) -> float:
     lap = cv2.Laplacian(u8_roi, cv2.CV_64F, ksize=3)
     return float(lap.var())
@@ -339,57 +333,41 @@ FOCUS_METHODS = [("Laplacian", focus_metric_laplacian),
                  ("Brenner",   focus_metric_brenner)]
 
 # ==== Autofokus (Stub) ======================================================
-
 class StepperController:
-    """Platzhalter für Z-Antrieb. Ersetze move_relative()/wait_settle() durch echte Ansteuerung."""
     def move_relative(self, steps: int):
-        # TODO: Implementieren (z. B. serielle Kommandos, GPIO, etc.)
         print(f"[Stepper] move_relative({steps}) (Stub)")
-
     def wait_settle(self, seconds: float = 0.12):
         time.sleep(seconds)
 
 def autofocus_hill_climb(get_focus_value, stepper: StepperController,
                          start_step=200, min_step=5, settle=0.12):
-    """
-    Einfache coarse→fine Hill-Climb-Suche auf Maximum der Schärfe.
-    get_focus_value(): callable → float (neuen RAW-Wert messen)
-    """
     cur = get_focus_value()
     step = start_step
     direction = +1
     improved = True
-
     while step >= min_step:
         stepper.move_relative(direction*step)
         stepper.wait_settle(settle)
         val = get_focus_value()
-
         if val > cur:
-            cur = val
-            improved = True
+            cur = val; improved = True
         else:
-            # zurück, Richtung wechseln, Schritt halbieren
             stepper.move_relative(-direction*step)
             stepper.wait_settle(settle)
             direction *= -1
             step = max(min_step, step // 2)
             improved = False
-
         if not improved and step > min_step:
             step = max(min_step, step // 2)
-
     return cur
 
 # ==== Main ==================================================================
-
 def main():
     ensure_paths()
     h = Harvester(); h.add_file(CTI_PATH); h.update()
     if not h.device_info_list:
         print("Keine GenTL-Geräte gefunden."); h.reset(); sys.exit(1)
 
-    # Zielgerät auswählen (per IP, sonst erstes)
     device_index = next((i for i,d in enumerate(h.device_info_list) if TARGET_IP in str(d)), 0)
 
     ia = create_ia(h, device_index)
@@ -399,18 +377,18 @@ def main():
     model  = get_val(nm, "DeviceModelName")
     serial = get_val(nm, "DeviceSerialNumber")
 
-    # Start: Full-FOV
     set_roi_full(nm)
     ia.start()
 
     cv2.namedWindow("Live", cv2.WINDOW_AUTOSIZE)
-    print("Tasten: ←↑→↓ ROI  [ ] Größe  R Center  M Metrik  H Stretch  B/N Bin ±  X/Z Dec ±  0 Reset  1/2/3 AOI  +/- Exp  G/g Gain  SPACE/P Snapshot  F AF  ESC")
+    print("Tasten: ←↑→↓ ROI (J/I/L/K Fallback)  [ ] Größe  R Center  M Metrik  H Stretch  "
+          "B/N Bin ±  X/Z Dec ±  0 Reset  1/2/3 AOI  +/- Exp  G/g Gain  SPACE/P Snapshot  F AF  ESC")
 
-    # Mess-ROI
     auto_stretch = DISPLAY_STRETCH
     method_idx = 0
     ema = None
     ema_alpha = 0.2
+
     roi_w, roi_h = 256, 256
     roi_step = 16
     roi_x, roi_y = 100, 100
@@ -421,56 +399,44 @@ def main():
 
     try:
         while True:
-            # Frame holen (mit Kopie)
             with ia.fetch(timeout=1500) as buf:
                 comp = buf.payload.components[0]
                 disp_u8, decode_label = to_display_u8_copy(comp, pf_str)
 
-            hgt, wid = disp_u8.shape[:2]
+            cam_h, cam_w = disp_u8.shape[:2]   # <-- KEIN 'h' überschreiben!
+            roi_w = max(32, min(roi_w, cam_w))
+            roi_h = max(32, min(roi_h, cam_h))
+            roi_x = min(max(0, roi_x), cam_w - roi_w)
+            roi_y = min(max(0, roi_y), cam_h - roi_h)
 
-            # ROI clampen
-            roi_w = max(32, min(roi_w, wid))
-            roi_h = max(32, min(roi_h, hgt))
-            roi_x = min(max(0, roi_x), wid - roi_w)
-            roi_y = min(max(0, roi_y), hgt - roi_h)
-
-            # Schärfe (RAW + EMA)
             name, func = FOCUS_METHODS[method_idx]
             roi = disp_u8[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
             raw = func(roi)
             if ema is None: ema = raw
             else: ema = ema_alpha*raw + (1.0-ema_alpha)*ema
 
-            # FPS
             frames += 1
             now = time.time()
             if now - last >= 1.0:
                 disp_fps = frames/(now-last); frames=0; last=now
 
-            # Anzeige
             show = disp_u8
             vmin, vmax = int(show.min()), int(show.max())
             if auto_stretch and vmax > vmin:
                 show = cv2.normalize(disp_u8, None, 0, 255, cv2.NORM_MINMAX)
 
             out = show.copy()
-            # ROI-Kasten
             cv2.rectangle(out, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), 255, 2)
 
-            # Status-/Info-Text
             b_h, b_v, d_h, d_v = get_scaling_state(nm)
-            w = int(get_val(nm, "Width") or wid)
-            h = int(get_val(nm, "Height") or hgt)
+            cam_w_node = int(get_val(nm, "Width") or cam_w)
+            cam_h_node = int(get_val(nm, "Height") or cam_h)
             exp = get_float(nm, exp_name)
-            # Gain-Knotenname erkennen
-            if supports(nm, "Gain"):
-                gname = "Gain"
-            else:
-                gname = "GainRaw"
+            gname = "Gain" if supports(nm, "Gain") else "GainRaw"
             gain = get_float(nm, gname)
 
             lines = [
-                f"{model} SN:{serial}  {w}x{h}  PF={pf_str} / {decode_label}",
+                f"{model} SN:{serial}  {cam_w_node}x{cam_h_node}  PF={pf_str} / {decode_label}",
                 f"Focus({name})  raw={raw:,.1f}   ema={ema:,.1f}   ROI={roi_w}x{roi_h}@({roi_x},{roi_y})",
                 f"FPS={disp_fps:.1f}  Exp={int(exp) if exp else '—'}us  Gain={gain:.2f}dB  Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Stretch={'ON' if auto_stretch else 'OFF'}"
             ]
@@ -480,46 +446,38 @@ def main():
 
             cv2.imshow("Live", out)
 
-            # -------- Tastatur ----------
-            k = cv2.waitKey(1) & 0xFF
+            # --- Tastatur (waitKeyEx für Pfeile) ---
+            k = cv2.waitKeyEx(1)
             if k == 27:  # ESC
                 break
 
-
-            # Snapshot: SPACE (32) / P
-            elif k == 32 or k in (ord('p'), ord('P')):
+            elif k == 32 or k in (ord('p'), ord('P')):  # SPACE / P
                 fn = time.strftime("snapshot_%Y%m%d_%H%M%S.png")
-                cv2.imwrite(fn, disp_u8)
-                print("Snapshot:", fn)
+                cv2.imwrite(fn, disp_u8); print("Snapshot:", fn)
 
-            # Stretch: H
             elif k in (ord('h'), ord('H')):
                 auto_stretch = not auto_stretch
 
-            # Pfeile: 81=←, 82=↑, 83=→, 84=↓ (OpenCV-Qt Codes)
-            elif k == 106:  # Left
+            # Pfeile (robust) + Fallback I/J/K/L
+            elif (k in ARROW_LEFT_CODES) or (k in (ord('j'), ord('J'))):
                 roi_x -= roi_step
-                print("left")
-            elif k == 105:  # Up
+            elif (k in ARROW_UP_CODES) or (k in (ord('i'), ord('I'))):
                 roi_y -= roi_step
-                print("top")
-            elif k == 108:  # Right
+            elif (k in ARROW_RIGHT_CODES) or (k in (ord('l'), ord('L'))):
                 roi_x += roi_step
-                print("right")
-            elif k == 107:  # Down
+            elif (k in ARROW_DOWN_CODES) or (k in (ord('k'), ord('K'))):
                 roi_y += roi_step
-                print("down")
 
-            # ROI Größe / Zentrum
+            # ROI Größe / Zentrieren
             elif k == ord('['):
                 roi_w = max(32, roi_w - 16); roi_h = max(32, roi_h - 16)
             elif k == ord(']'):
-                roi_w = min(wid, roi_w + 16); roi_h = min(hgt, roi_h + 16)
+                roi_w = min(cam_w, roi_w + 16); roi_h = min(cam_h, roi_h + 16)
             elif k in (ord('r'), ord('R')):
-                roi_w, roi_h = min(256, wid), min(256, hgt)
-                roi_x, roi_y = (wid - roi_w)//2, (hgt - roi_h)//2
+                roi_w, roi_h = min(256, cam_w), min(256, cam_h)
+                roi_x, roi_y = (cam_w - roi_w)//2, (cam_h - roi_h)//2
 
-            # Schärfemetrik: M
+            # Schärfemetrik
             elif k in (ord('m'), ord('M')):
                 method_idx = (method_idx + 1) % len(FOCUS_METHODS)
                 ema = None
@@ -529,17 +487,15 @@ def main():
                 scale = 1.0 if k==ord('1') else 0.5 if k==ord('2') else 0.25
                 stop_destroy(ia)
                 ia, nm, exp_name, gain_name, pf_str = restart_with_roi(h, device_index, pf_str, scale)
-                # Mess-ROI an neue Größe anpassen (Zentrieren)
-                hgt, wid = int(get_val(nm, "Height")), int(get_val(nm, "Width"))
-                roi_w, roi_h = min(roi_w, wid), min(roi_h, hgt)
-                roi_x, roi_y = (wid - roi_w)//2, (hgt - roi_h)//2
-                print(f"AOI neu → {wid}x{hgt}")
+                cam_h, cam_w = int(get_val(nm, "Height")), int(get_val(nm, "Width"))
+                roi_w, roi_h = min(roi_w, cam_w), min(roi_h, cam_h)
+                roi_x, roi_y = (cam_w - roi_w)//2, (cam_h - roi_h)//2
+                print(f"AOI neu → {cam_w}x{cam_h}")
 
-            # Autofokus (Hill-Climb; misst RAW-Werte auf frischen Frames)
+            # Autofokus (RAW auf frischen Frames)
             elif k in (ord('f'), ord('F')):
                 print("Starte Autofokus …")
                 def get_focus_now():
-                    # neues Bild synchron ziehen & RAW-Schärfe auf aktueller ROI und Metrik messen
                     with ia.fetch(timeout=1500) as bf:
                         cp = bf.payload.components[0]
                         im_u8, _ = to_display_u8_copy(cp, pf_str)
@@ -549,28 +505,38 @@ def main():
                 autofocus_hill_climb(get_focus_now, stepper, start_step=200, min_step=5, settle=0.12)
                 print("Autofokus fertig.")
 
-            # Binning / Decimation / Reset
+            # Binning / Decimation / Reset (robust)
             elif k in (ord('b'), ord('B'), ord('n'), ord('N'), ord('x'), ord('X'), ord('z'), ord('Z'), ord('0')):
-                b_h, b_v, d_h, d_v = get_scaling_state(nm)
-                if k in (ord('b'), ord('B')):        # Binning +
-                    new_factor = max(b_h, b_v) + 1; use_binning = True
-                elif k in (ord('n'), ord('N')):      # Binning -
-                    new_factor = max(1, max(b_h, b_v) - 1); use_binning = True
-                elif k in (ord('x'), ord('X')):      # Decimation +
-                    new_factor = max(d_h, d_v) + 1; use_binning = False
-                elif k in (ord('z'), ord('Z')):      # Decimation -
-                    new_factor = max(1, max(d_h, d_v) - 1); use_binning = False
-                else:                                 # '0' = Reset
-                    new_factor = 1; use_binning = True
+                try:
+                    b_h, b_v, d_h, d_v = get_scaling_state(nm)
+                    if k in (ord('b'), ord('B')):        # Binning +
+                        desired = max(b_h, b_v) + 1; use_binning = True
+                    elif k in (ord('n'), ord('N')):      # Binning -
+                        desired = max(1, max(b_h, b_v) - 1); use_binning = True
+                    elif k in (ord('x'), ord('X')):      # Decimation +
+                        desired = max(d_h, d_v) + 1; use_binning = False
+                    elif k in (ord('z'), ord('Z')):      # Decimation -
+                        desired = max(1, max(d_h, d_v) - 1); use_binning = False
+                    else:                                 # '0' Reset
+                        desired = 1; use_binning = True
 
-                stop_destroy(ia)
-                ia, nm, exp_name, gain_name, pf_str = restart_with_scaling(h, device_index, pf_str, use_binning, new_factor)
-                # ROI wieder ins Zentrum
-                hgt, wid = int(get_val(nm, "Height")), int(get_val(nm, "Width"))
-                roi_w, roi_h = min(roi_w, wid), min(roi_h, hgt)
-                roi_x, roi_y = (wid - roi_w)//2, (hgt - roi_h)//2
-                b_h, b_v, d_h, d_v = get_scaling_state(nm)
-                print(f"Scaling neu → Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Auflösung={wid}x{hgt}")
+                    if (use_binning and desired == max(b_h, b_v)) or ((not use_binning) and desired == max(d_h, d_v)):
+                        print("Scaling unverändert – keine Aktion.")
+                    else:
+                        stop_destroy(ia)
+                        ia, nm, exp_name, gain_name, pf_str = restart_with_scaling(
+                            h, device_index, pf_str, use_binning, desired
+                        )
+                        cam_h, cam_w = int(get_val(nm, "Height")), int(get_val(nm, "Width"))
+                        roi_w, roi_h = min(roi_w, cam_w), min(roi_h, cam_h)
+                        roi_x, roi_y = (cam_w - roi_w)//2, (cam_h - roi_h)//2
+
+                except Exception as e:
+                    print("Fehler beim Scaling:", e)
+                    try:
+                        ia, nm, exp_name, gain_name, pf_str = restart_stream(h, device_index, pf_str)
+                    except Exception as ee:
+                        print("Restart-Fehler:", ee)
 
             # Exposure / Gain
             elif k in (ord('+'), ord('-'), ord('g'), ord('G')):
@@ -583,10 +549,7 @@ def main():
                     set_node(nm, exp_name, float(new))
                     print(f"Exposure -> {new:.0f} us")
                 if k in (ord('g'), ord('G')):
-                    if supports(nm, "Gain"):
-                        gname = "Gain"
-                    else:
-                        gname = "GainRaw"
+                    gname = "Gain" if supports(nm, "Gain") else "GainRaw"
                     gmin, gmax = get_limits(nm, gname)
                     curg = get_float(nm, gname) or START_GAIN_DB
                     delta = 1.0 if k==ord('G') else -1.0
@@ -598,7 +561,9 @@ def main():
     finally:
         try: stop_destroy(ia)
         except Exception: pass
-        h.reset()
+        # ACHTUNG: Hier ist 'h' wieder der Harvester!
+        try: h.reset()
+        except Exception: pass
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
