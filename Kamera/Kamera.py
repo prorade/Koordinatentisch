@@ -1,10 +1,12 @@
-# baumer_live_focus_ui_keys.py
+# baumer_live_focus_af_ui.py
 # Baumer VCX Live-Viewer (GenTL/Harvester) mit:
-# - Stabiler Anzeige (Frame-Kopie), robuster Pixel-Decode
-# - Mess-ROI + Schärfemetrik (raw & EMA)
-# - AOI-Neustart (1/2/3), Binning/Decimation (robust)
-# - Autofokus-Stub (Hill-Climb)
-# - **Keys-Fenster**: zeigt ALLE Tastenkürzel, per '?' ein-/ausblenden (standardmäßig AN)
+# - Stabiler Anzeige (Frame-Kopie, kein Tearing)
+# - Robuster Pixel-Decode (Mono8 / Mono12Packed / Mono12 / Mono16 / Mono10)
+# - Mess-ROI + Schärfemetriken (Laplacian / Tenengrad / Brenner), raw & EMA
+# - Keys-Fenster (kompakt), per '?' ein-/ausblenden, Fenster frei skalierbar
+# - Nicht-blockierender Autofokus (Hill-Climb-StateMachine), F = Start/Stop (Toggle)
+# - Binning/Decimation (gleiches FOV), AOI-Profile (1/2/3) – alles mit sauberem Neustart
+# - Pfeiltasten (robust) + J/I/L/K als Fallback
 
 import os, sys, time, cv2
 import numpy as np
@@ -22,6 +24,14 @@ START_FPS         = 60.0
 WANT_PACKET       = 9000
 WANT_THROUGHPUT   = 0
 DISPLAY_STRETCH   = False
+
+# ==== Autofokus-Parameter ====================================================
+AF_START_STEP     = 200      # grober Startschritt (Stepper-Einheiten)
+AF_MIN_STEP       = 5        # feinste Schrittweite
+AF_SETTLE_SEC     = 0.12     # Wartezeit nach Bewegung
+AF_MAX_SECONDS    = 8.0      # Sicherheitszeitlimit
+AF_MAX_NO_IMPROVE = 6        # Abbruch nach N Nicht-Verbesserungen
+AF_EPS            = 1e-6     # minimale Verbesserung (Rausch-Toleranz)
 
 # ==== Arrow-Key Codes (robust) ==============================================
 ARROW_LEFT_CODES  = {81, 2424832, 0x250000}
@@ -114,6 +124,7 @@ def to_display_u8_copy(comp, pf_str: str):
     if "mono10" in pf and "packed" not in pf:
         img16 = np.frombuffer(u8.tobytes(), dtype=np.uint16, count=w*h).reshape(h, w); return (img16>>2).astype(np.uint8, copy=True), "Mono10 (>>2)"
 
+    # Fallback anhand Bytes/Pixel
     bpp = total / (w*h)
     if abs(bpp-1.0) < 1e-3:
         return u8.reshape(h, w).copy(), "8b(?)"
@@ -307,7 +318,7 @@ def restart_with_scaling(h, device_index, pf_hint, use_binning, factor):
             ok, df = apply_decimation(nm, factor); info = f"Decimation={df[0]}x{df[1]}"
             if not ok:
                 ok, bf = apply_binning(nm, factor, mode="Average"); info = f"Binning={bf[0]}x{bf[1]}"
-        set_roi_full(nm)
+        set_roi_full(nm)  # nach Scaling
     except Exception as e:
         print("Scaling-Fehler:", e); ok = False
 
@@ -348,45 +359,16 @@ FOCUS_METHODS = [("Laplacian", focus_metric_laplacian),
                  ("Brenner",   focus_metric_brenner)]
 
 # =============================================================================
-# Autofokus (Stub)
+# Autofokus (nicht-blockierende StateMachine)
 # =============================================================================
 class StepperController:
     def move_relative(self, steps: int): print(f"[Stepper] move_relative({steps}) (Stub)")
     def wait_settle(self, seconds: float = 0.12): time.sleep(seconds)
 
-def autofocus_hill_climb(get_focus_value, stepper: StepperController,
-                         start_step=200, min_step=5, settle=0.12):
-    cur = get_focus_value()
-    step = start_step
-    direction = +1
-    improved = True
-    while step >= min_step:
-        stepper.move_relative(direction*step)
-        stepper.wait_settle(settle)
-        val = get_focus_value()
-        if val > cur:
-            cur = val; improved = True
-        else:
-            stepper.move_relative(-direction*step)
-            stepper.wait_settle(settle)
-            direction *= -1
-            step = max(min_step, step // 2)
-            improved = False
-        if not improved and step > min_step:
-            step = max(min_step, step // 2)
-    return cur
-
 # =============================================================================
-# Keys-Fenster (UI)
+# Keys-Fenster (kompakt & skalierbar)
 # =============================================================================
 def render_keys_image(scale=0.48, title_scale=0.72):
-    """
-    Rendert ein kompaktes Keys-Poster.
-    - Kleine Schrift (scale ~ 0.48)
-    - Zwei Spalten, falls die erste Spalte voll ist
-    - Kürzere Texte, damit nichts abschneidet
-    """
-    # Kompaktere Texte
     lines = [
         "Tastenübersicht  (? = an/aus)",
         "",
@@ -400,7 +382,7 @@ def render_keys_image(scale=0.48, title_scale=0.72):
         "  M         Metrik wechseln",
         "  H         Display-Stretch",
         "",
-        "Binning/Decimation:",
+        "Binning / Decimation:",
         "  B / N     Bin +1 / −1",
         "  X / Z     Dec +1 / −1",
         "  0         Reset 1×",
@@ -408,71 +390,48 @@ def render_keys_image(scale=0.48, title_scale=0.72):
         "Kamera-AOI (Neustart):",
         "  1 / 2 / 3 Full / Half / Quarter",
         "",
-        "Belichtung/Verstärkung:",
+        "Belichtung / Verstärkung:",
         "  + / -     Exp ×1.5 / ÷1.5",
         "  G / g     Gain +1 / −1 dB",
         "",
         "Sonstiges:",
         "  SPACE / P Snapshot",
-        "  F         Autofokus (Stub)",
+        "  F         Autofokus (Toggle)",
         "  ESC       Beenden",
     ]
-
-    # Leinwand / Layout
-    W, H = 520, 520                       # kompakte Grundfläche
+    W, H = 520, 520
     PAD = 12
     COL_GAP = 20
     TITLE_H = 38
-    COL_W = (W - 3*PAD - COL_GAP) // 2    # zwei Spalten
-
+    COL_W = (W - 3*PAD - COL_GAP) // 2
     img = np.full((H, W, 3), 245, np.uint8)
-
-    # Titelbalken
     cv2.rectangle(img, (0, 0), (W, TITLE_H), (230, 230, 230), -1)
     cv2.putText(img, lines[0], (PAD, int(TITLE_H*0.7)),
                 cv2.FONT_HERSHEY_SIMPLEX, title_scale, (0, 0, 0), 2, cv2.LINE_AA)
-
-    # Text-Parameter
     line_h = max(18, int(24 * scale))
-    x = PAD
-    y = TITLE_H + 14
+    x = PAD; y = TITLE_H + 14
 
-    # Spalten-Renderer
     def put_line(text, x, y):
         cv2.putText(img, text, (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX, scale, (20, 20, 20), 2, cv2.LINE_AA)
 
-    # Spalte 1 … ggf. auf Spalte 2 umbrechen
     for t in lines[1:]:
         if t == "":
-            y += int(line_h * 0.5)
-            continue
-
-        # vor dem Zeichnen: bei Überlauf in nächste Spalte springen
+            y += int(line_h * 0.5); continue
         if y > H - PAD:
-            # Spalte 2 beginnen
-            x = PAD + COL_W + COL_GAP
-            y = TITLE_H + 14
-
-        # zu lange Einzelzeilen kompakt halten (harte, manuelle Umbrüche)
-        max_chars = 32 if x == PAD else 30  # Spalte 1 etwas breiter
+            x = PAD + COL_W + COL_GAP; y = TITLE_H + 14
+        max_chars = 32 if x == PAD else 30
         if len(t) > max_chars and " " in t:
-            # an geeigneter Stelle brechen (einfacher Greedy)
-            parts = []
             cur = t
             while len(cur) > max_chars and " " in cur:
                 cut = cur.rfind(" ", 0, max_chars)
                 if cut <= 0: break
-                parts.append(cur[:cut])
+                put_line(cur[:cut], x, y); y += line_h
                 cur = cur[cut+1:]
-            parts.append(cur)
-            for p in parts:
-                put_line(p, x, y); y += line_h
+            put_line(cur, x, y); y += line_h
         else:
             put_line(t, x, y); y += line_h
-
     return img
-
 
 # =============================================================================
 # Main
@@ -496,7 +455,8 @@ def main():
     ia.start()
 
     cv2.namedWindow("Live", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("Keys", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("Keys", cv2.WINDOW_NORMAL)   # frei skalierbar
+    cv2.resizeWindow("Keys", 520, 520)
     show_keys = True
     print("Drücke '?' um das Keys-Fenster zu zeigen/zu verbergen.")
 
@@ -510,6 +470,16 @@ def main():
     roi_x, roi_y = 100, 100
 
     stepper = StepperController()
+
+    # AF-State
+    af_active = False
+    af_started_ts = 0.0
+    af_last_move_ts = 0.0
+    af_waiting = False
+    af_step = AF_START_STEP
+    af_dir = +1
+    af_best = None
+    af_no_improve = 0
 
     last = time.time(); frames=0; disp_fps=0.0
 
@@ -525,17 +495,54 @@ def main():
             roi_x = min(max(0, roi_x), cam_w - roi_w)
             roi_y = min(max(0, roi_y), cam_h - roi_h)
 
+            # Schärfe
             name, func = FOCUS_METHODS[method_idx]
             roi = disp_u8[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
             raw = func(roi)
             if ema is None: ema = raw
             else: ema = ema_alpha*raw + (1.0-ema_alpha)*ema
 
-            frames += 1
+            # Nicht-blockierender AF
             now = time.time()
+            if af_active:
+                if now - af_started_ts > AF_MAX_SECONDS:
+                    print("AF: Timeout – abgebrochen."); af_active = False
+                else:
+                    if af_best is None:
+                        af_best = raw
+                        stepper.move_relative(af_dir * af_step)
+                        af_last_move_ts = now
+                        af_waiting = True
+                    else:
+                        if af_waiting and (now - af_last_move_ts) < AF_SETTLE_SEC:
+                            pass
+                        else:
+                            af_waiting = False
+                            improved = (raw > af_best + AF_EPS)
+                            if improved:
+                                af_best = raw
+                                af_no_improve = 0
+                                stepper.move_relative(af_dir * af_step)
+                                af_last_move_ts = now
+                                af_waiting = True
+                            else:
+                                af_no_improve += 1
+                                af_dir *= -1
+                                af_step = max(AF_MIN_STEP, af_step // 2)
+                                if (af_step <= AF_MIN_STEP and af_no_improve >= 2) or (af_no_improve >= AF_MAX_NO_IMPROVE):
+                                    print("AF: Ende – lokales Maximum / keine Verbesserung.")
+                                    af_active = False
+                                else:
+                                    stepper.move_relative(af_dir * af_step)
+                                    af_last_move_ts = now
+                                    af_waiting = True
+
+            # FPS
+            frames += 1
             if now - last >= 1.0:
                 disp_fps = frames/(now-last); frames=0; last=now
 
+            # Anzeige
             show = disp_u8
             vmin, vmax = int(show.min()), int(show.max())
             if auto_stretch and vmax > vmin:
@@ -550,11 +557,14 @@ def main():
             exp = get_float(nm, exp_name)
             gname = "Gain" if supports(nm, "Gain") else "GainRaw"
             gain = get_float(nm, gname)
+            af_state = ("RUN" if af_active else "OFF")
+            af_info = f"AF={af_state}" if not af_active or af_best is None else f"AF={af_state} step={af_step} dir={'+1' if af_dir>0 else '-1'} best={af_best:,.1f}"
 
             lines = [
                 f"{model} SN:{serial}  {cam_w_node}x{cam_h_node}  PF={pf_str} / {decode_label}",
                 f"Focus({name})  raw={raw:,.1f}   ema={ema:,.1f}   ROI={roi_w}x{roi_h}@({roi_x},{roi_y})",
-                f"FPS={disp_fps:.1f}  Exp={int(exp) if exp else '—'}us  Gain={gain:.2f}dB  Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Stretch={'ON' if auto_stretch else 'OFF'}   (?=Keys)"
+                f"FPS={disp_fps:.1f}  Exp={int(exp) if exp else '—'}us  Gain={gain:.2f}dB  Bin={b_h}x{b_v}  Dec={d_h}x{d_v}  Stretch={'ON' if auto_stretch else 'OFF'}   (?=Keys)",
+                af_info,
             ]
             y=20
             for t in lines:
@@ -565,13 +575,13 @@ def main():
             if show_keys:
                 cv2.imshow("Keys", render_keys_image())
             else:
-                # Fenster schließen, wenn es offen war
                 try: cv2.destroyWindow("Keys")
                 except Exception: pass
 
             # --- Tastatur (waitKeyEx für Pfeile) ---
             k = cv2.waitKeyEx(1)
             if k == 27:  # ESC
+                af_active = False
                 break
 
             elif k == ord('?'):
@@ -594,7 +604,7 @@ def main():
             elif (k in ARROW_DOWN_CODES) or (k in (ord('k'), ord('K'))):
                 roi_y += roi_step
 
-            # ROI Größe / Zentrum
+            # ROI Größe / Zentrieren
             elif k == ord('['):
                 roi_w = max(32, roi_w - 16); roi_h = max(32, roi_h - 16)
             elif k == ord(']'):
@@ -608,8 +618,24 @@ def main():
                 method_idx = (method_idx + 1) % len(FOCUS_METHODS)
                 ema = None
 
+            # Autofokus Toggle
+            elif k in (ord('f'), ord('F')):
+                if not af_active:
+                    af_active = True
+                    af_started_ts = time.time()
+                    af_step = AF_START_STEP
+                    af_dir = +1
+                    af_best = None
+                    af_no_improve = 0
+                    af_waiting = False
+                    print("AF: gestartet (F = Stop).")
+                else:
+                    af_active = False
+                    print("AF: manuell abgebrochen.")
+
             # Kamera-AOI (mit Neustart)
             elif k in (ord('1'), ord('2'), ord('3')):
+                af_active = False
                 scale = 1.0 if k==ord('1') else 0.5 if k==ord('2') else 0.25
                 stop_destroy(ia)
                 ia, nm, exp_name, gain_name, pf_str = restart_with_roi(h, device_index, pf_str, scale)
@@ -618,22 +644,10 @@ def main():
                 roi_x, roi_y = (cam_w - roi_w)//2, (cam_h - roi_h)//2
                 print(f"AOI neu → {cam_w}x{cam_h}")
 
-            # Autofokus (RAW auf frischen Frames)
-            elif k in (ord('f'), ord('F')):
-                print("Starte Autofokus …")
-                def get_focus_now():
-                    with ia.fetch(timeout=1500) as bf:
-                        cp = bf.payload.components[0]
-                        im_u8, _ = to_display_u8_copy(cp, pf_str)
-                    sub = im_u8[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-                    _, fnc = FOCUS_METHODS[method_idx]
-                    return float(fnc(sub))
-                autofocus_hill_climb(get_focus_now, stepper, start_step=200, min_step=5, settle=0.12)
-                print("Autofokus fertig.")
-
             # Binning / Decimation / Reset (robust)
             elif k in (ord('b'), ord('B'), ord('n'), ord('N'), ord('x'), ord('X'), ord('z'), ord('Z'), ord('0')):
                 try:
+                    af_active = False
                     b_h, b_v, d_h, d_v = get_scaling_state(nm)
                     if k in (ord('b'), ord('B')):        # Binning +
                         desired = max(b_h, b_v) + 1; use_binning = True
