@@ -1,240 +1,279 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import threading, queue, time
-import serial, serial.tools.list_ports
+#include <AccelStepper.h>
 
-BAUD = 115200
+/***  CNC-Shield V3 Pinning  ***/
+const int X_STEP = 2;  const int X_DIR = 5;
+const int Y_STEP = 3;  const int Y_DIR = 6;
+const int Z_STEP = 4;  const int Z_DIR = 7;
+const int EN_PIN = 8;
 
-class SerialClient:
-    def __init__(self):
-        self.ser = None
-        self.rxq = queue.Queue()
-        self._stop = threading.Event()
-        self.rx_thread = None
+/***  Steps/mm (DEINE kalibrierten Werte einsetzen)  ***/
+float X_STEPS_PER_MM = 410.3f;   // X kalibriert
+float Y_STEPS_PER_MM = 390.0f;   // Y kalibriert
+float Z_STEPS_PER_MM = 2222.2f;  // Z kalibriert (M5x0.8 @ 1/8 µStep ~2000..2222)
 
-    def ports(self):
-        return [p.device for p in serial.tools.list_ports.comports()]
+/***  Soft-Limits (mm)  ***/
+const float X_MIN_MM = 0.0f, X_MAX_MM = 140.0f;
+const float Y_MIN_MM = 0.0f, Y_MAX_MM = 70.0f;
+float       Z_MIN_MM = 0.0f, Z_MAX_MM = 60.0f;   // Z-Max bei Bedarf per Befehl änderbar
 
-    def connect(self, port):
-        self.close()
-        self.ser = serial.Serial(port, BAUD, timeout=0.05)
-        self._stop.clear()
-        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self.rx_thread.start()
+/***  Bewegungsprofil (Steps/s, Steps/s^2)  ***/
+const float X_MAXSPEED = 5000;   // ~ 12 mm/s bei deinen Steps/mm
+const float Y_MAXSPEED = 5000;
+const float Z_MAXSPEED = 3000;   // ~ 1.3 mm/s bei Z-Steps/mm
+const float X_ACCEL    = 2000;
+const float Y_ACCEL    = 2000;
+const float Z_ACCEL    = 800;
 
-    def close(self):
-        self._stop.set()
-        if self.rx_thread and self.rx_thread.is_alive():
-            self.rx_thread.join(timeout=0.3)
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-        self.ser = None
+/***  Stepper-Objekte  ***/
+AccelStepper X(AccelStepper::DRIVER, X_STEP, X_DIR);
+AccelStepper Y(AccelStepper::DRIVER, Y_STEP, Y_DIR);
+AccelStepper Z(AccelStepper::DRIVER, Z_STEP, Z_DIR);
 
-    def _rx_loop(self):
-        buf = b""
-        while not self._stop.is_set():
-            try:
-                data = self.ser.read(1024)
-                if data:
-                    buf += data
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        self.rxq.put(line.decode(errors="ignore").strip())
-                else:
-                    time.sleep(0.01)
-            except Exception:
-                time.sleep(0.1)
+/***  Raster-Scan-Parameter (XY)  ***/
+float dx = 10.0f, dy = 10.0f;     // Rasterabstände
+float spanX = 50.0f, spanY = 30.0f;
+int   nx = 0, ny = 0;
 
-    def send_line(self, s: str):
-        if self.ser and self.ser.is_open:
-            if not s.endswith("\n"):
-                s += "\n"
-            self.ser.write(s.encode("utf-8"))
+/***  Nullpunkt (Origin)  ***/
+float originX = 0.0f, originY = 0.0f, originZ = 0.0f;
+bool  backAfterScan = true;       // nach Scan automatisch zu (originX,originY)
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Koordinatentisch Bedienoberfläche")
-        self.geometry("980x620")
-        self.client = SerialClient()
-        self._build_ui()
-        self._poll_rx()
-        self.bind_all_hotkeys()
+/***  Entnahmeposition (Pickup)  ***/
+float pickX = 0.0f, pickY = 0.0f, pickZ = 0.0f;
 
-    def _build_ui(self):
-        # Top: connection
-        top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
-        ttk.Label(top, text="COM-Port:").pack(side="left")
-        self.port_combo = ttk.Combobox(top, width=15, values=self.client.ports())
-        self.port_combo.pack(side="left", padx=4)
-        ttk.Button(top, text="Aktualisieren", command=self.refresh_ports).pack(side="left", padx=4)
-        self.connect_btn = ttk.Button(top, text="Verbinden", command=self.toggle_connect)
-        self.connect_btn.pack(side="left", padx=8)
-        ttk.Button(top, text="Hilfe (H)", command=lambda: self.send("H")).pack(side="left")
-        ttk.Button(top, text="Parameter (P)", command=lambda: self.send("P")).pack(side="left", padx=4)
+/***  Steuerflags  ***/
+bool abortScan = false;
 
-        # Left column: jog & positions
-        left = ttk.Labelframe(self, text="Jog & Positionen"); left.pack(side="left", fill="y", padx=8, pady=8)
-        stepf = ttk.Frame(left); stepf.pack(pady=6)
-        ttk.Label(stepf, text="Jog-Schritt (mm):").pack(side="left")
-        self.jog_step = tk.DoubleVar(value=1.0)
-        ttk.Entry(stepf, textvariable=self.jog_step, width=7).pack(side="left", padx=4)
+/***  Helpers: Umrechnung & Limits  ***/
+long mmToStepsX(float mm){ return (long)(mm * X_STEPS_PER_MM); }
+long mmToStepsY(float mm){ return (long)(mm * Y_STEPS_PER_MM); }
+long mmToStepsZ(float mm){ return (long)(mm * Z_STEPS_PER_MM); }
 
-        # jog grid
-        grid = ttk.Frame(left); grid.pack(pady=6)
-        ttk.Button(grid, text="Y +", width=8, command=lambda: self.send(f"RY {self.jog_step.get()}")).grid(row=0, column=1, pady=2)
-        ttk.Button(grid, text="X -", width=8, command=lambda: self.send(f"RX {-self.jog_step.get()}")).grid(row=1, column=0, padx=2)
-        ttk.Button(grid, text="X +", width=8, command=lambda: self.send(f"RX {self.jog_step.get()}")).grid(row=1, column=2, padx=2)
-        ttk.Button(grid, text="Y -", width=8, command=lambda: self.send(f"RY {-self.jog_step.get()}")).grid(row=2, column=1, pady=2)
+float clampX(float x){ if (x < X_MIN_MM) return X_MIN_MM; if (x > X_MAX_MM) return X_MAX_MM; return x; }
+float clampY(float y){ if (y < Y_MIN_MM) return Y_MIN_MM; if (y > Y_MAX_MM) return Y_MAX_MM; return y; }
+float clampZ(float z){ if (z < Z_MIN_MM) return Z_MIN_MM; if (z > Z_MAX_MM) return Z_MAX_MM; return z; }
 
-        # Z jog
-        zf = ttk.Frame(left); zf.pack(pady=6)
-        ttk.Label(zf, text="Z-Jog (PgUp / PgDn):").pack()
-        ttk.Button(zf, text="Z +", width=8, command=lambda: self.send(f"RZ {self.jog_step.get()}")).pack(side="left", padx=4)
-        ttk.Button(zf, text="Z -", width=8, command=lambda: self.send(f"RZ {-self.jog_step.get()}")).pack(side="left", padx=4)
+/***  Bewegungen  ***/
+void goToXY_mm(float x_mm, float y_mm) {
+  x_mm = clampX(x_mm);  y_mm = clampY(y_mm);
+  X.moveTo(mmToStepsX(x_mm));
+  Y.moveTo(mmToStepsY(y_mm));
+  while (X.distanceToGo()!=0 || Y.distanceToGo()!=0) {
+    if (abortScan) return;
+    X.run(); Y.run();
+  }
+}
 
-        # absolute moves
-        absf = ttk.Labelframe(left, text="Absolut anfahren (mm)")
-        absf.pack(pady=8, fill="x")
-        self.abs_x = tk.DoubleVar(value=0.0)
-        self.abs_y = tk.DoubleVar(value=0.0)
-        self.abs_z = tk.DoubleVar(value=0.0)
-        row = ttk.Frame(absf); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="X:").pack(side="left"); ttk.Entry(row, textvariable=self.abs_x, width=8).pack(side="left", padx=4)
-        ttk.Button(row, text="X fahren", command=lambda: self.send(f"X {self.abs_x.get()}")).pack(side="left", padx=4)
-        row = ttk.Frame(absf); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Y:").pack(side="left"); ttk.Entry(row, textvariable=self.abs_y, width=8).pack(side="left", padx=4)
-        ttk.Button(row, text="Y fahren", command=lambda: self.send(f"Y {self.abs_y.get()}")).pack(side="left", padx=4)
-        row = ttk.Frame(absf); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Z:").pack(side="left"); ttk.Entry(row, textvariable=self.abs_z, width=8).pack(side="left", padx=4)
-        ttk.Button(row, text="Z fahren", command=lambda: self.send(f"Z {self.abs_z.get()}")).pack(side="left", padx=4)
+void goToZ_mm(float z_mm) {
+  z_mm = clampZ(z_mm);
+  Z.moveTo(mmToStepsZ(z_mm));
+  while (Z.distanceToGo()!=0) {
+    if (abortScan) return;
+    Z.run();
+  }
+}
 
-        # origin & pickup
-        op = ttk.Labelframe(left, text="Nullpunkt & Entnahme")
-        op.pack(fill="x", pady=8)
-        ttk.Button(op, text="Origin XY setzen (O)", command=lambda: self.send("O")).pack(fill="x", pady=2)
-        ttk.Button(op, text="Origin Z setzen (OZ)", command=lambda: self.send("OZ")).pack(fill="x", pady=2)
-        ttk.Button(op, text="Origin XYZ setzen (O0)", command=lambda: self.send("O0")).pack(fill="x", pady=2)
-        ttk.Separator(op, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(op, text="zu Origin XY (R)", command=lambda: self.send("R")).pack(fill="x", pady=2)
-        ttk.Button(op, text="zu Origin Z (RZ0)", command=lambda: self.send("RZ0")).pack(fill="x", pady=2)
-        ttk.Button(op, text="zu Origin XYZ (R0)", command=lambda: self.send("R0")).pack(fill="x", pady=2)
-        ttk.Separator(op, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(op, text="Entnahme = aktuelle XYZ (PSET)", command=lambda: self.send("PSET")).pack(fill="x", pady=2)
-        pickf = ttk.Frame(op); pickf.pack(fill="x", pady=2)
-        self.pick_x = tk.DoubleVar(value=0.0)
-        self.pick_y = tk.DoubleVar(value=0.0)
-        self.pick_z = tk.DoubleVar(value=0.0)
-        ttk.Entry(pickf, textvariable=self.pick_x, width=8).pack(side="left", padx=2)
-        ttk.Entry(pickf, textvariable=self.pick_y, width=8).pack(side="left", padx=2)
-        ttk.Entry(pickf, textvariable=self.pick_z, width=8).pack(side="left", padx=2)
-        ttk.Button(op, text="Entnahme setzen (P x y z)", command=self.set_pick_xyz).pack(fill="x", pady=2)
-        ttk.Button(op, text="Entnahme XY (PEXY)", command=lambda: self.send("PEXY")).pack(fill="x", pady=2)
-        ttk.Button(op, text="Entnahme XYZ (PE)", command=lambda: self.send("PE")).pack(fill="x", pady=2)
-        ttk.Button(op, text="Entnahme anzeigen (P?)", command=lambda: self.send("P?")).pack(fill="x", pady=2)
+void goToXYZ_mm(float x_mm, float y_mm, float z_mm) {
+  x_mm = clampX(x_mm);  y_mm = clampY(y_mm);  z_mm = clampZ(z_mm);
+  X.moveTo(mmToStepsX(x_mm));
+  Y.moveTo(mmToStepsY(y_mm));
+  Z.moveTo(mmToStepsZ(z_mm));
+  while (X.distanceToGo()!=0 || Y.distanceToGo()!=0 || Z.distanceToGo()!=0) {
+    if (abortScan) return;
+    X.run(); Y.run(); Z.run();
+  }
+}
 
-        # Right column: scan & ZMAX & console
-        right = ttk.Labelframe(self, text="Scan & System"); right.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+/***  Infoausgaben  ***/
+void printHelp(){
+  Serial.println(F("Befehle (115200 Baud):"));
+  Serial.println(F("  H            : Hilfe"));
+  Serial.println(F("  P            : Parameter anzeigen"));
+  Serial.println(F("  O            : aktuellen Punkt als Origin XY setzen"));
+  Serial.println(F("  OZ           : aktuellen Z als Origin Z setzen"));
+  Serial.println(F("  O0           : aktuellen Punkt als Origin XYZ setzen"));
+  Serial.println(F("  S            : Raster-Scan starten (XY, Serpentine)"));
+  Serial.println(F("  R            : XY zum Nullpunkt (originX,originY)"));
+  Serial.println(F("  RZ0          : Z zum Nullpunkt (originZ)"));
+  Serial.println(F("  R0           : XYZ zum Nullpunkt (originX,Y,Z)"));
+  Serial.println(F("  BA 0/1       : Auto-Rueckfahrt nach Scan AUS/AN"));
+  Serial.println(F("  X <mm>       : X ABSOLUT anfahren"));
+  Serial.println(F("  Y <mm>       : Y ABSOLUT anfahren"));
+  Serial.println(F("  Z <mm>       : Z ABSOLUT anfahren"));
+  Serial.println(F("  RX <mm>      : X RELATIV verfahren"));
+  Serial.println(F("  RY <mm>      : Y RELATIV verfahren"));
+  Serial.println(F("  RZ <mm>      : Z RELATIV verfahren"));
+  Serial.println(F("  g <x> <y>    : ABSOLUT zu (x,y)"));
+  Serial.println(F("  g <x> <y> <z>: ABSOLUT zu (x,y,z)"));
+  Serial.println(F("  ZMAX <mm>    : Z-Max-Softlimit setzen"));
+  Serial.println(F("  PSET         : aktuelle XYZ als Entnahme speichern"));
+  Serial.println(F("  P <x> <y> <z>: Entnahmeposition setzen"));
+  Serial.println(F("  PE           : Entnahmeposition XYZ anfahren"));
+  Serial.println(F("  PEXY         : Entnahmeposition nur XY anfahren"));
+  Serial.println(F("  P?           : Entnahmeposition anzeigen"));
+  Serial.println(F("  !            : Abbrechen/Stop"));
+  Serial.println();
+}
 
-        sc = ttk.Frame(right); sc.pack(fill="x", pady=4)
-        self.dx = tk.DoubleVar(value=10.0)
-        self.dy = tk.DoubleVar(value=10.0)
-        self.spanx = tk.DoubleVar(value=50.0)
-        self.spany = tk.DoubleVar(value=30.0)
-        ttk.Label(sc, text="dx:").grid(row=0, column=0); ttk.Entry(sc, textvariable=self.dx, width=7).grid(row=0, column=1)
-        ttk.Label(sc, text="dy:").grid(row=0, column=2); ttk.Entry(sc, textvariable=self.dy, width=7).grid(row=0, column=3)
-        ttk.Label(sc, text="spanX:").grid(row=1, column=0); ttk.Entry(sc, textvariable=self.spanx, width=7).grid(row=1, column=1)
-        ttk.Label(sc, text="spanY:").grid(row=1, column=2); ttk.Entry(sc, textvariable=self.spany, width=7).grid(row=1, column=3)
-        ttk.Button(sc, text="Setzen", command=self.apply_scan_params).grid(row=0, column=4, padx=6)
-        ttk.Button(sc, text="Scan starten (S)", command=lambda: self.send("S")).grid(row=1, column=4, padx=6)
-        ttk.Button(sc, text="Abbrechen (!)", command=lambda: self.send("!")).grid(row=2, column=4, padx=6, pady=2)
+void printParams(){
+  Serial.println(F("=== Parameter ==="));
+  Serial.print(F("Steps/mm: X=")); Serial.print(X_STEPS_PER_MM,3);
+  Serial.print(F("  Y=")); Serial.print(Y_STEPS_PER_MM,3);
+  Serial.print(F("  Z=")); Serial.println(Z_STEPS_PER_MM,3);
+  Serial.print(F("Soft-Limits: X[0..")); Serial.print(X_MAX_MM,1);
+  Serial.print(F("]  Y[0..")); Serial.print(Y_MAX_MM,1);
+  Serial.print(F("]  Z["));
+  Serial.print(Z_MIN_MM,1); Serial.print(F("..")); Serial.print(Z_MAX_MM,1); Serial.println(F("] mm"));
+  Serial.print(F("Origin XYZ: ("));
+  Serial.print(originX,3); Serial.print(F(", "));
+  Serial.print(originY,3); Serial.print(F(", "));
+  Serial.print(originZ,3); Serial.println(F(") mm"));
+  Serial.print(F("Raster: dx=")); Serial.print(dx,3);
+  Serial.print(F("  dy=")); Serial.print(dy,3);
+  Serial.print(F("  spanX=")); Serial.print(spanX,3);
+  Serial.print(F("  spanY=")); Serial.println(spanY,3);
+  Serial.print(F("Auto-Rueckfahrt nach Scan: "));
+  Serial.println(backAfterScan ? F("AN") : F("AUS"));
+  Serial.print(F("Entnahme XYZ: ("));
+  Serial.print(pickX,3); Serial.print(F(", "));
+  Serial.print(pickY,3); Serial.print(F(", "));
+  Serial.print(pickZ,3); Serial.println(F(") mm"));
+  Serial.println(F("================="));
+}
 
-        zmaxf = ttk.Frame(right); zmaxf.pack(fill="x", pady=4)
-        self.zmax = tk.DoubleVar(value=60.0)
-        ttk.Label(zmaxf, text="ZMAX:").pack(side="left")
-        ttk.Entry(zmaxf, textvariable=self.zmax, width=7).pack(side="left", padx=4)
-        ttk.Button(zmaxf, text="Setzen", command=lambda: self.send(f"ZMAX {self.zmax.get()}")).pack(side="left", padx=4)
+/***  Raster-Scan (XY)  ***/
+void doScanSerpentine(){
+  float x0 = originX, y0 = originY;
 
-        # Console
-        cons = ttk.Frame(right); cons.pack(fill="both", expand=True, pady=4)
-        self.txt = tk.Text(cons, height=18)
-        self.txt.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(cons, command=self.txt.yview); sb.pack(side="right", fill="y")
-        self.txt.configure(yscrollcommand=sb.set)
-        self.cmd_entry = ttk.Entry(right)
-        self.cmd_entry.pack(fill="x")
-        self.cmd_entry.bind("<Return>", lambda e: self.send(self.cmd_entry.get(), clear=True))
+  // Start zum Nullpunkt XY
+  abortScan = false;
+  goToXY_mm(x0, y0); if (abortScan) return;
 
-        # footer
-        foot = ttk.Frame(self); foot.pack(fill="x", padx=8, pady=4)
-        ttk.Label(foot, text="Tastatur: Pfeile=XY, Bild↑/Bild↓=Z, S=Scan, !=Abbruch").pack(side="left")
+  // Anzahl Punkte
+  nx = (dx>0) ? (int)(spanX/dx)+1 : 1;
+  ny = (dy>0) ? (int)(spanY/dy)+1 : 1;
+  if (nx<1) nx=1; if (ny<1) ny=1;
 
-    def bind_all_hotkeys(self):
-        self.bind("<Left>",  lambda e: self.send(f"RX {-self.jog_step.get()}"))
-        self.bind("<Right>", lambda e: self.send(f"RX {self.jog_step.get()}"))
-        self.bind("<Up>",    lambda e: self.send(f"RY {self.jog_step.get()}"))
-        self.bind("<Down>",  lambda e: self.send(f"RY {-self.jog_step.get()}"))
-        self.bind("<Prior>", lambda e: self.send(f"RZ {self.jog_step.get()}"))   # PageUp
-        self.bind("<Next>",  lambda e: self.send(f"RZ {-self.jog_step.get()}"))  # PageDown
-        self.bind("s",       lambda e: self.send("S"))
-        self.bind("!",       lambda e: self.send("!"))
+  Serial.print(F("Starte Scan: nx=")); Serial.print(nx);
+  Serial.print(F(" ny=")); Serial.println(ny);
 
-    def refresh_ports(self):
-        self.port_combo["values"] = self.client.ports()
+  for (int j=0; j<ny && !abortScan; ++j) {
+    float y = clampY(y0 + j*dy);
+    if ((j % 2) == 0) {
+      for (int i=0; i<nx && !abortScan; ++i) {
+        float x = clampX(x0 + i*dx);
+        goToXY_mm(x, y);
+      }
+    } else {
+      for (int i=nx-1; i>=0 && !abortScan; --i) {
+        float x = clampX(x0 + i*dx);
+        goToXY_mm(x, y);
+      }
+    }
+    if (j < ny-1 && !abortScan) {
+      float yNext = clampY(y0 + (j+1)*dy);
+      goToXY_mm(X.currentPosition()/X_STEPS_PER_MM, yNext);
+    }
+  }
 
-    def toggle_connect(self):
-        if self.client.ser and self.client.ser.is_open:
-            self.client.close()
-            self.connect_btn.config(text="Verbinden")
-            self.log("Getrennt.")
-        else:
-            port = self.port_combo.get().strip()
-            if not port:
-                messagebox.showwarning("Hinweis", "Bitte COM-Port wählen.")
-                return
-            try:
-                self.client.connect(port)
-                self.connect_btn.config(text="Trennen")
-                self.log(f"Verbunden mit {port}.")
-                # Initial: Hilfe & Parameter abfragen
-                self.send("H"); self.send("P")
-            except Exception as ex:
-                messagebox.showerror("Fehler", f"Konnte nicht verbinden:\n{ex}")
+  if (abortScan) {
+    Serial.println(F("Scan abgebrochen."));
+  } else {
+    Serial.println(F("Scan fertig."));
+    if (backAfterScan) {
+      Serial.println(F("Zurueck zu Origin XY..."));
+      goToXY_mm(originX, originY);
+      Serial.println(F("Am Origin XY."));
+    }
+  }
+}
 
-    def send(self, line, clear=False):
-        if not line: return
-        self.client.send_line(line)
-        self.log(f"> {line}")
-        if clear:
-            self.cmd_entry.delete(0, "end")
+/***  Setup / Loop  ***/
+void setup(){
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW);  // Treiber aktiv
 
-    def set_pick_xyz(self):
-        self.send(f"P {self.pick_x.get()} {self.pick_y.get()} {self.pick_z.get()}")
+  X.setMaxSpeed(X_MAXSPEED);  X.setAcceleration(X_ACCEL);
+  Y.setMaxSpeed(Y_MAXSPEED);  Y.setAcceleration(Y_ACCEL);
+  Z.setMaxSpeed(Z_MAXSPEED);  Z.setAcceleration(Z_ACCEL);
 
-    def apply_scan_params(self):
-        self.send(f"dx {self.dx.get()}")
-        self.send(f"dy {self.dy.get()}")
-        self.send(f"sx {self.spanx.get()}")
-        self.send(f"sy {self.spany.get()}")
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("\nSystem bereit. 'H' fuer Hilfe."));
+  printParams();
+}
 
-    def _poll_rx(self):
-        try:
-            while True:
-                line = self.client.rxq.get_nowait()
-                self.log(line)
-        except queue.Empty:
-            pass
-        self.after(50, self._poll_rx)
+void loop(){
+  if (Serial.available()){
+    String cmd = Serial.readStringUntil('\n'); cmd.trim();
 
-    def log(self, msg):
-        self.txt.insert("end", msg + "\n")
-        self.txt.see("end")
+    if (cmd.equalsIgnoreCase("H")) { printHelp(); }
+    else if (cmd.equalsIgnoreCase("P")) { printParams(); }
 
-    def on_closing(self):
-        self.client.close()
-        self.destroy()
+    else if (cmd.equalsIgnoreCase("O"))  { originX = X.currentPosition()/X_STEPS_PER_MM; originY = Y.currentPosition()/Y_STEPS_PER_MM; Serial.println(F("Origin XY gesetzt.")); }
+    else if (cmd.equalsIgnoreCase("OZ")) { originZ = Z.currentPosition()/Z_STEPS_PER_MM; Serial.println(F("Origin Z gesetzt.")); }
+    else if (cmd.equalsIgnoreCase("O0")) { originX = X.currentPosition()/X_STEPS_PER_MM; originY = Y.currentPosition()/Y_STEPS_PER_MM; originZ = Z.currentPosition()/Z_STEPS_PER_MM; Serial.println(F("Origin XYZ gesetzt.")); }
 
-if __name__ == "__main__":
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    else if (cmd.equalsIgnoreCase("S"))  { abortScan = false; doScanSerpentine(); }
+    else if (cmd.equals("!"))            { abortScan = true; }
+
+    else if (cmd.equalsIgnoreCase("R"))  { abortScan = true; goToXY_mm(originX, originY); Serial.println(F("Am Origin XY.")); }
+    else if (cmd.equalsIgnoreCase("RZ0")){ abortScan = true; goToZ_mm(originZ);          Serial.println(F("Am Origin Z.")); }
+    else if (cmd.equalsIgnoreCase("R0")) { abortScan = true; goToXYZ_mm(originX, originY, originZ); Serial.println(F("Am Origin XYZ.")); }
+
+    else if (cmd.startsWith("BA ")) { backAfterScan = (cmd.substring(3).toInt()!=0); Serial.print(F("backAfterScan = ")); Serial.println(backAfterScan?F("AN"):F("AUS")); }
+
+    else if (cmd.startsWith("X "))   { float v = cmd.substring(2).toFloat(); goToXY_mm(clampX(v), Y.currentPosition()/Y_STEPS_PER_MM); }
+    else if (cmd.startsWith("Y "))   { float v = cmd.substring(2).toFloat(); goToXY_mm(X.currentPosition()/X_STEPS_PER_MM, clampY(v)); }
+    else if (cmd.startsWith("Z "))   { float v = cmd.substring(2).toFloat(); goToZ_mm(clampZ(v)); }
+    else if (cmd.startsWith("RX "))  { float v = cmd.substring(3).toFloat(); float cx = X.currentPosition()/X_STEPS_PER_MM; goToXY_mm(clampX(cx+v), Y.currentPosition()/Y_STEPS_PER_MM); }
+    else if (cmd.startsWith("RY "))  { float v = cmd.substring(3).toFloat(); float cy = Y.currentPosition()/Y_STEPS_PER_MM; goToXY_mm(X.currentPosition()/X_STEPS_PER_MM, clampY(cy+v)); }
+    else if (cmd.startsWith("RZ "))  { float v = cmd.substring(3).toFloat(); float cz = Z.currentPosition()/Z_STEPS_PER_MM; goToZ_mm(clampZ(cz+v)); }
+
+    else if (cmd.startsWith("g ")) {
+      // g x y    oder   g x y z
+      float tx=0, ty=0, tz=Z.currentPosition()/Z_STEPS_PER_MM;
+      int sp1 = cmd.indexOf(' ');
+      int sp2 = cmd.indexOf(' ', sp1+1);
+      if (sp2>sp1){
+        int sp3 = cmd.indexOf(' ', sp2+1);
+        tx = cmd.substring(sp1+1, sp2).toFloat();
+        if (sp3==-1) {
+          ty = cmd.substring(sp2+1).toFloat();
+          goToXY_mm(tx, ty);
+        } else {
+          ty = cmd.substring(sp2+1, sp3).toFloat();
+          tz = cmd.substring(sp3+1).toFloat();
+          goToXYZ_mm(tx, ty, tz);
+        }
+      }
+    }
+
+    else if (cmd.startsWith("ZMAX ")) { Z_MAX_MM = cmd.substring(5).toFloat(); Serial.print(F("Z_MAX_MM = ")); Serial.println(Z_MAX_MM,3); }
+
+    else if (cmd.equalsIgnoreCase("PSET")) { pickX = X.currentPosition()/X_STEPS_PER_MM; pickY = Y.currentPosition()/Y_STEPS_PER_MM; pickZ = Z.currentPosition()/Z_STEPS_PER_MM; Serial.println(F("Entnahme XYZ gelernt.")); }
+    else if (cmd.startsWith("P?")) { Serial.print(F("Entnahme XYZ: (")); Serial.print(pickX,3); Serial.print(F(", ")); Serial.print(pickY,3); Serial.print(F(", ")); Serial.print(pickZ,3); Serial.println(F(") mm")); }
+    else if (cmd.startsWith("P ")) {
+      // P x y z
+      float px=pickX, py=pickY, pz=pickZ;
+      int sp1 = cmd.indexOf(' ');
+      int sp2 = cmd.indexOf(' ', sp1+1);
+      int sp3 = cmd.indexOf(' ', sp2+1);
+      if (sp1>0 && sp2>sp1 && sp3>sp2) {
+        px = cmd.substring(sp1+1, sp2).toFloat();
+        py = cmd.substring(sp2+1, sp3).toFloat();
+        pz = cmd.substring(sp3+1).toFloat();
+        pickX=clampX(px); pickY=clampY(py); pickZ=clampZ(pz);
+        Serial.println(F("Entnahmeposition gesetzt."));
+      } else {
+        Serial.println(F("Format: P <x> <y> <z>"));
+      }
+    }
+    else if (cmd.equalsIgnoreCase("PE"))   { goToXYZ_mm(pickX, pickY, pickZ); Serial.println(F("Entnahme XYZ angefahren.")); }
+    else if (cmd.equalsIgnoreCase("PEXY")) { goToXY_mm(pickX, pickY);         Serial.println(F("Entnahme XY angefahren.")); }
+
+    else { Serial.println(F("Unbekannter Befehl. 'H' fuer Hilfe.")); }
+  }
+
+  X.run(); Y.run(); Z.run();
+}
