@@ -15,7 +15,7 @@ from harvesters.core import Harvester
 # ==== Pfade/Kamera ===========================================================
 BIN_DIR  = r"H:\Baumer_neoAPI_1.5.0_win_x86_64_cpp\bin"   # <— ANPASSEN
 CTI_PATH = rf"{BIN_DIR}\bgapi2_gige.cti"                  # <— ANPASSEN
-TARGET_IP = "192.168.178.2"                               # optional: Kamera-IP
+TARGET_IP = "192.168.178.158"                               # optional: Kamera-IP
 
 # ==== Start-Defaults =========================================================
 START_EXPOSURE_US = 5000.0
