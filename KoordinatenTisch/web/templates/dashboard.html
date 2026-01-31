@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Koordinaten Tisch – Kamera</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <div class="title">Koordinaten Tisch</div>
+        <div class="actions">
+          <button id="btnStart">Kamera Start</button>
+          <button id="btnStop">Kamera Stop</button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="panel video">
+          <div class="panel-title">Live</div>
+          <div class="video-wrap">
+            <img id="camImg" src="/camera/stream" alt="Kamera Stream" />
+          </div>
+        </section>
+
+        <section class="panel info">
+          <div class="panel-title">Kamera Werte</div>
+
+          <table class="kv">
+            <tr><th>Status</th><td id="v_started">—</td></tr>
+            <tr><th>Model</th><td id="v_model">—</td></tr>
+            <tr><th>Serial</th><td id="v_serial">—</td></tr>
+            <tr><th>Auflösung</th><td id="v_res">—</td></tr>
+            <tr><th>PixelFormat</th><td id="v_pf">—</td></tr>
+            <tr><th>Decode</th><td id="v_decode">—</td></tr>
+
+            <tr><th>Stream FPS</th><td id="v_streamfps">—</td></tr>
+            <tr><th>Kamera FPS</th><td id="v_camfps">—</td></tr>
+
+            <tr><th>Exposure (µs)</th><td id="v_exp">—</td></tr>
+            <tr><th>Gain (dB)</th><td id="v_gain">—</td></tr>
+
+            <tr><th>Binning</th><td id="v_bin">—</td></tr>
+            <tr><th>Decimation</th><td id="v_dec">—</td></tr>
+          </table>
+
+          <div class="hint">
+            Werte werden automatisch aktualisiert (Polling).
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
