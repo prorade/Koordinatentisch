@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KoordinatenTisch</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header headerBar">
+        <h1>KoordinatenTisch</h1>
+        <div class="headerRight">
+          <div class="status" id="statusLine">Status: —</div>
+          <button class="iconBtn" id="btnOpenSettings" title="Einstellungen" aria-label="Einstellungen">
+            ⚙
+          </button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <div class="topRow">
+          <section class="panel videoPanel">
+            <h2>Live Bild</h2>
+            <div class="videoWrap">
+              <img id="video" src="/video_feed" alt="Live" />
+            </div>
+          </section>
+
+          <section class="panel tablePanel">
+            <h2>Koordinaten Tisch</h2>
+            <div class="canvasWrap">
+              <canvas id="tableCanvas" width="520" height="360"></canvas>
+            </div>
+            <div class="small">Startposition + angefahrene Punkte</div>
+          </section>
+        </div>
+
+        <div class="bottomRow">
+          <section class="panel controlPanel">
+            <h2>Steuerung</h2>
+            <div class="controls">
+              <div class="dpad">
+                <button class="btn" data-jog="up">▲</button>
+                <div class="row">
+                  <button class="btn" data-jog="left">◀</button>
+                  <button class="btn" data-jog="down">▼</button>
+                  <button class="btn" data-jog="right">▶</button>
+                </div>
+                <div class="row">
+                  <button class="btn" data-jog="zup">Z+</button>
+                  <button class="btn" data-jog="zdown">Z-</button>
+                </div>
+              </div>
+
+              <div class="actions">
+                <label class="toggle"><input type="checkbox" id="demoToggle" /> Demo Modus</label>
+                <button class="btn primary" id="btnSetStart">Startposition setzen</button>
+                <button class="btn primary" id="btnRun">Start</button>
+                <button class="btn danger" id="btnStop">Stop</button>
+              </div>
+
+              <div class="metrics" id="metrics">
+                <div><strong>Start</strong>: <span id="mStart">—</span></div>
+                <div><strong>Zeit</strong>: <span id="mTime">—</span></div>
+                <div><strong>Punkte</strong>: <span id="mCount">—</span></div>
+                <div><strong>Genauigkeit</strong>: <span id="mAcc">—</span></div>
+                <div class="small" id="mMsg">—</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel positionsPanel">
+            <h2>Positionen</h2>
+            <ul class="list" id="posList"></ul>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" id="settingsModal" aria-hidden="true">
+      <div class="modalHeader" id="settingsModalHeader">
+        <div class="modalTitle">Einstellungen</div>
+        <div class="modalHeaderActions">
+          <button class="iconBtn" id="btnCloseSettings" title="Schließen" aria-label="Schließen">✕</button>
+        </div>
+      </div>
+      <div class="modalBody">
+        <div class="settings">
+          <div class="settingsHeader">
+            <div class="settingsTitle">Arbeitsbereich (mm)</div>
+            <button class="btn" id="btnApplyWorkArea">Setzen</button>
+          </div>
+          <div class="settingsBody">
+            <div class="workAreaRow">
+              <label class="workAreaField">
+                <div class="small">Breite X (mm)</div>
+                <input type="number" id="workAreaX" min="1" step="1" />
+              </label>
+              <label class="workAreaField">
+                <div class="small">Länge Y (mm)</div>
+                <input type="number" id="workAreaY" min="1" step="1" />
+              </label>
+            </div>
+            <div class="small">Gilt für Canvas-Skalierung und Demo-Punkt-Generierung.</div>
+          </div>
+
+          <div class="settingsHeader">
+            <div class="settingsTitle">Fokus / Schärfe</div>
+          </div>
+          <div class="settingsBody">
+            <label class="workAreaField">
+              <div class="small">Schärfe Threshold (0 = Auto)</div>
+              <input type="number" id="focusThreshold" min="0" step="1" />
+            </label>
+            <div class="small">Größer = strenger. Bei 0 wird der Threshold automatisch aus dem ersten erfolgreichen QR abgeleitet.</div>
+          </div>
+
+          <hr class="sep" />
+
+          <div class="settingsHeader">
+            <div class="settingsTitle">Kamera Features (writable + available)</div>
+            <button class="btn" id="btnReloadCam">Neu laden</button>
+          </div>
+          <div class="settingsBody" id="camFeatures">
+            <div class="small">Lade…</div>
+          </div>
+
+          <hr class="sep" />
+
+          <div class="settingsHeader">
+            <div class="settingsTitle">GRBL Settings ($$)</div>
+            <button class="btn" id="btnReloadGrbl">Neu laden</button>
+          </div>
+          <div class="settingsBody" id="grblSettings">
+            <div class="small">Lade…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

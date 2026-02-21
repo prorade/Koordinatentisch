@@ -1,55 +1,63 @@
-from __future__ import annotations
-
 import os
-from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
-class BaseConfig:
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
-
-    # Flask run params (für __main__)
-    DEBUG: bool = False
-    HOST: str = os.getenv("FLASK_HOST", "127.0.0.1")
-    PORT: int = int(os.getenv("FLASK_PORT", "5000"))
-
-    # App-spezifische Defaults
-    GRBL_BAUDRATE: int = int(os.getenv("GRBL_BAUDRATE", "115200"))
-    GRBL_DEFAULT_PORT: str = os.getenv("GRBL_DEFAULT_PORT", "")
-    CAMERA_DEVICE_INDEX: int = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
-    BAUMER_BIN_DIR: str = os.getenv("BAUMER_BIN_DIR", r"H:\Baumer_neoAPI_1.5.0_win_x86_64_cpp\bin")
-    BAUMER_CTI_PATH: str = os.getenv("BAUMER_CTI_PATH", r"H:\Baumer_neoAPI_1.5.0_win_x86_64_cpp\bin\bgapi2_gige.cti")
-    BAUMER_TARGET_IP: str = os.getenv("BAUMER_TARGET_IP", "192.168.178.158")
-
-    CAM_START_EXPOSURE_US: float = float(os.getenv("CAM_START_EXPOSURE_US", "5000"))
-    CAM_START_GAIN_DB: float = float(os.getenv("CAM_START_GAIN_DB", "6"))
-    CAM_START_FPS: float = float(os.getenv("CAM_START_FPS", "60"))
-    CAM_WANT_PACKET: int = int(os.getenv("CAM_WANT_PACKET", "9000"))
-    CAM_WANT_THROUGHPUT: int = int(os.getenv("CAM_WANT_THROUGHPUT", "0"))
-    CAM_DISPLAY_STRETCH: bool = os.getenv("CAM_DISPLAY_STRETCH", "0") == "1"
+def _env(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return default if value is None or value == "" else value
 
 
-
-@dataclass(frozen=True)
-class DevConfig(BaseConfig):
-    DEBUG: bool = True
-
-
-@dataclass(frozen=True)
-class ProdConfig(BaseConfig):
-    DEBUG: bool = False
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
 
 
-@dataclass(frozen=True)
-class TestConfig(BaseConfig):
-    DEBUG: bool = True
-    TESTING: bool = True
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
 
 
-def get_config():
-    env = os.getenv("FLASK_ENV", "dev").lower()
-    if env in ("prod", "production"):
-        return ProdConfig
-    if env in ("test", "testing"):
-        return TestConfig
-    return DevConfig
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# Camera
+CAMERA_EXPOSURE_US = _env_int("CAMERA_EXPOSURE_US", 10000)
+CAMERA_FPS = _env_float("CAMERA_FPS", 10.0)
+
+# If you have multiple cameras you can set an optional serial.
+CAMERA_SERIAL = _env("CAMERA_SERIAL", "")
+
+# GRBL
+GRBL_PORT = _env("GRBL_PORT", "COM3")
+GRBL_BAUD = _env_int("GRBL_BAUD", 115200)
+
+# Motion
+JOG_STEP_MM = _env_float("JOG_STEP_MM", 0.25)
+JOG_FEED_MM_MIN = _env_float("JOG_FEED_MM_MIN", 300.0)
+RAPID_FEED_MM_MIN = _env_float("RAPID_FEED_MM_MIN", 1200.0)
+
+# Workflow
+QR_RETRY_SECONDS = _env_float("QR_RETRY_SECONDS", 8.0)
+
+# Focus (sharpness check)
+# 0 => auto (threshold derived from first successful QR read)
+FOCUS_THRESHOLD = _env_float("FOCUS_THRESHOLD", 0.0)
+
+# Work area (machine coordinates, mm). Used for canvas scaling and demo point generation.
+WORK_AREA_X_MM = _env_float("WORK_AREA_X_MM", 200.0)
+WORK_AREA_Y_MM = _env_float("WORK_AREA_Y_MM", 150.0)
+
+# Demo
+DEMO_MODE = _env_bool("DEMO_MODE", False)
+DEMO_POINTS = _env_int("DEMO_POINTS", 12)
+DEMO_SPAN_X_MM = _env_float("DEMO_SPAN_X_MM", 60.0)
+DEMO_SPAN_Y_MM = _env_float("DEMO_SPAN_Y_MM", 40.0)
+DEMO_TOL_MM = _env_float("DEMO_TOL_MM", 0.5)
+DEMO_SEED = _env("DEMO_SEED", "")
