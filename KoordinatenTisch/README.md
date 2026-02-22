@@ -18,7 +18,7 @@ pip install -r requirements.txt
 Baumer neoAPI (lokales Wheel aus dem Repo) installieren (Python-Version muss passen, z.B. cp310/cp311/cp312):
 
 ```powershell
-pip install .\baumerLib\Baumer_neoAPI_1.5.0_win_x86_64_python\wheel\baumer_neoapi-1.5.0-cp310.cp311.cp312-none-win_amd64.whl
+pip install .\baumerLib\Baumer_neoAPI_1.5.0_win_x86_64_python\wheel\baumer_neoapi-1.5.0-cp34.cp35.cp36.cp37.cp38.cp39.cp310.cp311.cp312-none-win_amd64.whl
 ```
 
 3. (Optional) GRBL-Port/FPS/Exposure konfigurieren (per Environment Variablen):
@@ -60,3 +60,6 @@ Die App läuft dann unter `http://127.0.0.1:5000`.
 Hinweis zu Koordinaten:
 - Diese Minimal-App verwendet bewusst Maschinenkoordinaten (GRBL `MPos`) und sendet absolute Fahrten als `G53`.
 - Das passt zu Setups, in denen `$H` (Homing) die Maschinen-Null auf `0,0,0` setzt und alle Zielpositionen absolut von dort angegeben werden.
+
+
+https://stackoverflow.com/questions/59138351/opencv-with-gige-vision-cameras-baumer-and-python
